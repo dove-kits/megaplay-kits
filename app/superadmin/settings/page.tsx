@@ -6,9 +6,10 @@ import { useRouter } from 'next/navigation';
 import Image from 'next/image';
 import { isSuperAdmin } from '@/lib/utils/roleCheck';
 import { 
-  getAppSettings, 
-  updateAppSettings, 
-  AppSettings,
+  getAppSettings,
+initializeSettingsIfNeeded,
+updateAppSettings,
+AppSettings,
   addDepartment,
   removeDepartment,
   addHostel,
@@ -86,28 +87,33 @@ export default function SuperAdminSettingsPage() {
   }, [user, authLoading]);
 
   const loadSettings = async () => {
-    try {
-      setLoading(true);
-      const [settingsData, committeesData] = await Promise.all([
-        getAppSettings(),
-        getBaseCommittees(),
-      ]);
-      
-      if (settingsData) {
-        setSettings(settingsData);
-        setRegistrationOpen(settingsData.registrationOpen ?? false);
-        setActiveCommittees(settingsData.activeCommittees || []);
-        setDepartments(settingsData.departments || []);
-        setHostels(settingsData.hostels || []);
-      }
+  try {
+    setLoading(true);
 
-      setBaseCommittees(Array.isArray(committeesData) ? committeesData : []);
-    } catch (error) {
-      console.error('Failed to load settings:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+    // Initialize settings if they don't exist
+    const settingsData = await initializeSettingsIfNeeded(
+      "2026",
+      user?.email || "system"
+    );
+
+    const committeesData = await getBaseCommittees();
+
+    setSettings(settingsData);
+    setRegistrationOpen(settingsData.registrationOpen ?? false);
+    setActiveCommittees(settingsData.activeCommittees || []);
+    setDepartments(settingsData.departments || []);
+    setHostels(settingsData.hostels || []);
+
+    setBaseCommittees(
+      Array.isArray(committeesData) ? committeesData : []
+    );
+
+  } catch (error) {
+    console.error('Failed to load settings:', error);
+  } finally {
+    setLoading(false);
+  }
+};
 
   const handleToggleRegistration = async () => {
     if (!user?.email) return;
