@@ -444,7 +444,10 @@ export const getAllStudents = async (year: string): Promise<Student[]> => {
 
     const colName = getYearCollectionName('students', year);
     const snapshot = await getDocs(collection(db, colName));
-    return snapshot.docs.map((d) => d.data() as Student);
+    // Skip placeholder docs (older years contain an "_init" doc)
+    return snapshot.docs
+      .filter((d) => d.id !== '_init' && d.id !== 'metadata')
+      .map((d) => d.data() as Student);
   } catch (error) {
     console.error('Error getting all students:', error);
     return [];
