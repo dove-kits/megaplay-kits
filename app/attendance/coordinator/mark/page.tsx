@@ -259,60 +259,7 @@ export default function CoordinatorHomePage() {
             </button>
 
             {/* Lab Card */}
-            <button
-              onClick={() => router.push('/attendance/coordinator/mark/lab')}
-              className="group relative bg-white/5 backdrop-blur-xl border border-white/10 hover:border-purple-400/50 rounded-3xl p-6 sm:p-10 text-left transition-all hover:scale-[1.02] hover:shadow-2xl active:scale-[0.98]"
-            >
-              <div className="absolute inset-0 bg-gradient-to-br from-purple-500/10 to-pink-500/10 rounded-3xl opacity-0 group-hover:opacity-100 transition-opacity"></div>
-              
-              <div className="relative">
-                {/* Icon */}
-                <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl bg-purple-500/20 border border-purple-400/30 flex items-center justify-center mb-4 sm:mb-6 group-hover:scale-110 transition-transform shadow-xl">
-                  <svg
-                    className="w-8 h-8 sm:w-10 sm:h-10 text-purple-400"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"
-                    />
-                  </svg>
-                </div>
-
-                {/* Title */}
-                <h3 className="text-xl sm:text-2xl font-bold text-white mb-2 sm:mb-3 group-hover:text-purple-300 transition-colors">
-                  Lab Sessions
-                </h3>
-
-                {/* Description */}
-                <p className="text-white/70 text-xs sm:text-sm mb-4 sm:mb-6 leading-relaxed">
-                  Mark attendance for laboratory and practical sessions. 
-                  Technical committee work and experiments.
-                </p>
-
-                {/* Arrow */}
-                <div className="flex items-center text-purple-400 font-medium text-sm">
-                  <span>Start Marking</span>
-                  <svg
-                    className="w-5 h-5 ml-2 group-hover:translate-x-2 transition-transform"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M13 7l5 5m0 0l-5 5m5-5H6"
-                    />
-                  </svg>
-                </div>
-              </div>
-            </button>
+           
           </div>
         </main>
       </div>
