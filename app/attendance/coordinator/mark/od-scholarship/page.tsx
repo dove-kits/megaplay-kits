@@ -6,7 +6,11 @@ import { useRouter } from 'next/navigation';
 import Image from 'next/image';
 import { getAppSettings } from '@/lib/services/settingsService';
 import { isCoordinator } from '@/lib/services/coordinatorService';
-import { getSessionsByDate, Session } from '@/lib/services/sessionService';
+import {
+  getSessionsByDate,
+  getLocalDateString,
+  Session,
+} from '@/lib/services/sessionService';
 import {
   markAttendance,
   getSessionAttendance,
@@ -14,9 +18,6 @@ import {
   AttendanceRecord,
 } from '@/lib/services/attendanceService';
 import { getBaseCommittees, BaseCommittee } from '@/lib/services/committeeService';
-import { doc, getDoc } from 'firebase/firestore';
-import { db } from '@/lib/firebase/config';
-import { getYearCollectionName } from '@/lib/services/settingsService';
 
 export default function ODScholarshipMarkingPage() {
   const { user, loading: authLoading, signOut } = useAuth();
@@ -67,7 +68,8 @@ export default function ODScholarshipMarkingPage() {
       return;
     }
     loadData();
-  }, [user, authLoading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.uid, authLoading]);
 
   const loadData = async () => {
     try {
@@ -89,12 +91,14 @@ export default function ODScholarshipMarkingPage() {
         return;
       }
 
-      // Load base committees
+      // Load base committees (cached 5 min)
       const committees = await getBaseCommittees();
       setBaseCommittees(Array.isArray(committees) ? committees : []);
 
-      // Set default date to today
-      const today = new Date().toISOString().split('T')[0];
+      // Set default date to today in LOCAL time.
+      // (new Date().toISOString() is UTC, so in India it returns yesterday
+      // between 12:00 AM and 5:30 AM.)
+      const today = getLocalDateString();
       setSelectedDate(today);
       await loadSessionsForDate(today, settings.currentYear);
     } catch (error) {
@@ -147,12 +151,13 @@ export default function ODScholarshipMarkingPage() {
     if (!currentYear) return;
 
     try {
-      const attendance = await getSessionAttendance(currentYear, session.sessionId);
-      // Filter by markedCategory for OD/Scholarship page
-      const filtered = attendance.filter((a) => 
-        a.markedCategory === 'od' || a.markedCategory === 'scholarship'
-      );
-      setMarkedStudents(filtered);
+      // Server-side category filter: only OD + Scholarship records are read
+      // (lab records of the same session are NOT read and thrown away).
+      const attendance = await getSessionAttendance(currentYear, session.sessionId, [
+        'od',
+        'scholarship',
+      ]);
+      setMarkedStudents(attendance);
     } catch (error) {
       console.error('Failed to load attendance:', error);
     }
@@ -172,41 +177,20 @@ export default function ODScholarshipMarkingPage() {
       return;
     }
 
+    if (selectedSession.status === 'cancelled') {
+      setError('This session is cancelled. Reactivate it before marking attendance.');
+      return;
+    }
+
     setMarking(true);
     setError('');
     setSuccessMessage(null);
 
     try {
-      // Get student's registered category first
-      const studentsCol = getYearCollectionName('students', currentYear);
-      const studentRef = doc(db, studentsCol, regnoInput.trim().toUpperCase());
-      const studentSnap = await getDoc(studentRef);
-
-      if (!studentSnap.exists()) {
-        setError('Student not found in database');
-        setMarking(false);
-        return;
-      }
-
-      const studentData = studentSnap.data();
-
-      if (studentData.status !== 'approved') {
-        setError('Student registration is not approved');
-        setMarking(false);
-        return;
-      }
-
-      // Determine the markedCategory based on student's registeredCategory
-      let markedCategory: 'od' | 'scholarship';
-      
-      if (studentData.category === 'scholarship') {
-        markedCategory = 'scholarship';
-      } else {
-        // For 'normal' category students, mark as 'od'
-        markedCategory = 'od';
-      }
-
-      // Mark attendance with the appropriate category
+      // 'auto' = markAttendance reads the student ONCE, checks it exists and is
+      // approved, and picks the category itself:
+      //   scholarship student -> 'scholarship', everyone else -> 'od'.
+      // (The page used to read the student too, so every mark cost an extra read.)
       const result = await markAttendance(
         currentYear,
         selectedSession.sessionId,
@@ -214,7 +198,7 @@ export default function ODScholarshipMarkingPage() {
         selectedDate,
         selectedSession.sessionNumber,
         regnoInput.trim().toUpperCase(),
-        markedCategory,
+        'auto',
         user.email
       );
 
@@ -460,7 +444,7 @@ export default function ODScholarshipMarkingPage() {
                               Session {session.sessionNumber}: {session.name}
                             </p>
                             <p className="text-xs sm:text-sm text-white/60 mt-1">
-                              {session.attendanceCount} students marked • {session.status}
+                              {session.status}
                             </p>
                           </div>
                           <svg
