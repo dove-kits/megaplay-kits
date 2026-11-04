@@ -11,9 +11,15 @@ import {
   serverTimestamp,
   updateDoc,
   writeBatch,
+  getCountFromServer,
 } from 'firebase/firestore';
 import { db } from '../firebase/config';
 import { getYearCollectionName } from './settingsService';
+import { TTLCache } from '../utils/ttlCache';
+
+// Session lists change rarely: cache per year for 5 minutes.
+// Every write in this file clears the cache for that year.
+const sessionsCache = new TTLCache<Session[]>(5 * 60 * 1000);
 
 export interface Session {
   sessionId: string;
@@ -32,8 +38,8 @@ const BATCH_LIMIT = 450;
 
 /**
  * Today's date as YYYY-MM-DD in the user's LOCAL timezone.
- * FIX: `new Date().toISOString()` is UTC, so in India (UTC+5:30) "today"
- * was still yesterday between 12:00 AM and 5:30 AM.
+ * `new Date().toISOString()` is UTC, so in India (UTC+5:30) "today"
+ * would still be yesterday between 12:00 AM and 5:30 AM.
  */
 export const getLocalDateString = (d: Date = new Date()): string => {
   const y = d.getFullYear();
@@ -72,6 +78,7 @@ export const createSessions = async (
   });
 
   await batch.commit();
+  sessionsCache.delete(year);
   console.log(`✅ Created ${sessionNames.length} sessions for ${date}`);
 };
 
@@ -98,8 +105,13 @@ export const getSessionsByDate = async (
   }
 };
 
-// Get all sessions for a year (1 read per session)
-export const getAllSessions = async (year: string): Promise<Session[]> => {
+// Get all sessions for a year (1 read per session, then cached 5 min)
+export const getAllSessions = async (year: string, force = false): Promise<Session[]> => {
+  if (!force) {
+    const cached = sessionsCache.get(year);
+    if (cached) return [...cached];
+  }
+
   try {
     const colName = getYearCollectionName('sessions', year);
     const snap = await getDocs(collection(db, colName));
@@ -126,7 +138,8 @@ export const getAllSessions = async (year: string): Promise<Session[]> => {
       return dateB.localeCompare(dateA); // newest date first
     });
 
-    return sessions;
+    sessionsCache.set(year, sessions);
+    return [...sessions];
   } catch (error) {
     console.error('Error getting all sessions:', error);
     return [];
@@ -170,24 +183,29 @@ export const updateSessionName = async (
 
     const colName = getYearCollectionName('sessions', year);
     await updateDoc(doc(db, colName, sessionId), { name: newName.trim() });
+    sessionsCache.delete(year);
   } catch (error) {
     console.error('Error updating session name:', error);
     throw error;
   }
 };
 
-// Check if session has attendance records
+/**
+ * Check if a session has attendance records.
+ * Uses a COUNT aggregation: ~1 read in total instead of 1 read per record.
+ */
 export const checkSessionAttendance = async (
   year: string,
   sessionId: string
 ): Promise<{ hasAttendance: boolean; count: number }> => {
   try {
     const colName = getYearCollectionName('attendance', year);
-    const snap = await getDocs(
+    const snap = await getCountFromServer(
       query(collection(db, colName), where('sessionId', '==', sessionId))
     );
+    const count = snap.data().count;
 
-    return { hasAttendance: !snap.empty, count: snap.size };
+    return { hasAttendance: count > 0, count };
   } catch (error) {
     console.error('Error checking session attendance:', error);
     return { hasAttendance: false, count: 0 };
@@ -196,10 +214,8 @@ export const checkSessionAttendance = async (
 
 /**
  * Delete session (and optionally its attendance).
- * FIX: a single batch is limited to 500 operations. A session with ~500
- * attendance records + the session doc exceeded that and failed. Attendance
- * is now deleted in chunks, and the session doc is removed last so a failed
- * run can simply be retried.
+ * A single batch is limited to 500 operations, so attendance is deleted in
+ * chunks and the session doc is removed last so a failed run can be retried.
  */
 export const deleteSession = async (
   year: string,
@@ -222,9 +238,11 @@ export const deleteSession = async (
       }
 
       await deleteDoc(doc(db, sessionColName, sessionId));
+      sessionsCache.delete(year);
       console.log(`✅ Session ${sessionId} and ${snap.size} attendance records deleted`);
     } else {
       await deleteDoc(doc(db, sessionColName, sessionId));
+      sessionsCache.delete(year);
       console.log('✅ Session deleted:', sessionId);
     }
   } catch (error) {
@@ -274,6 +292,7 @@ export const updateSessionStatus = async (
     }
 
     if (sessionsToUpdate.length > 0) {
+      sessionsCache.delete(year);
       console.log(`✅ Updated ${sessionsToUpdate.length} sessions to completed`);
     }
 
@@ -289,41 +308,24 @@ export const updateSessionStatus = async (
   }
 };
 
-// Get sessions count by status
+/**
+ * Sessions count by status.
+ * Uses the cached session list instead of re-reading the whole collection.
+ */
 export const getSessionsCountByStatus = async (
   year: string
 ): Promise<{ active: number; completed: number; cancelled: number; total: number }> => {
   try {
-    const colName = getYearCollectionName('sessions', year);
-    const snap = await getDocs(collection(db, colName));
+    const sessions = await getAllSessions(year);
 
-    let active = 0;
-    let completed = 0;
-    let cancelled = 0;
-    let total = 0;
-
-    snap.forEach((d) => {
-      if (d.id === 'metadata' || d.id === '_init') return;
-
-      const data = d.data();
-      if (!data.sessionId) return;
-
-      total++;
-
-      switch (data.status) {
-        case 'active':
-          active++;
-          break;
-        case 'completed':
-          completed++;
-          break;
-        case 'cancelled':
-          cancelled++;
-          break;
-      }
+    const counts = { active: 0, completed: 0, cancelled: 0, total: sessions.length };
+    sessions.forEach((s) => {
+      if (s.status === 'active') counts.active++;
+      else if (s.status === 'completed') counts.completed++;
+      else if (s.status === 'cancelled') counts.cancelled++;
     });
 
-    return { active, completed, cancelled, total };
+    return counts;
   } catch (error) {
     console.error('Error getting sessions count:', error);
     return { active: 0, completed: 0, cancelled: 0, total: 0 };
@@ -345,6 +347,7 @@ export const cancelSession = async (year: string, sessionId: string): Promise<vo
   try {
     const colName = getYearCollectionName('sessions', year);
     await updateDoc(doc(db, colName, sessionId), { status: 'cancelled' });
+    sessionsCache.delete(year);
   } catch (error) {
     console.error('Error cancelling session:', error);
     throw error;
@@ -356,6 +359,7 @@ export const reactivateSession = async (year: string, sessionId: string): Promis
   try {
     const colName = getYearCollectionName('sessions', year);
     await updateDoc(doc(db, colName, sessionId), { status: 'active' });
+    sessionsCache.delete(year);
   } catch (error) {
     console.error('Error reactivating session:', error);
     throw error;
@@ -371,20 +375,24 @@ export const updateSessionAttendanceCount = async (
   try {
     const colName = getYearCollectionName('sessions', year);
     await updateDoc(doc(db, colName, sessionId), { attendanceCount: count });
+    sessionsCache.delete(year);
   } catch (error) {
     console.error('Error updating attendance count:', error);
     throw error;
   }
 };
 
-// Create a single session for a date (for adding to existing dates)
+/**
+ * Create a single session for a date (for adding to existing dates).
+ * Returns the created session so the UI can append it without re-reading.
+ */
 export const createSingleSession = async (
   year: string,
   date: string,
   sessionNumber: number,
   sessionName: string,
   createdBy: string
-): Promise<void> => {
+): Promise<Session> => {
   const colName = getYearCollectionName('sessions', year);
 
   // Unique ID using timestamp to avoid conflicts
@@ -404,5 +412,26 @@ export const createSingleSession = async (
   };
 
   await setDoc(ref, sessionData);
+  sessionsCache.delete(year);
   console.log(`✅ Created session ${sessionNumber} for ${date}`);
+
+  return sessionData;
+};
+
+/**
+ * Number of sessions in a year using a COUNT aggregation:
+ * costs ~1 read in total instead of 1 read per session.
+ * `date >= '0'` skips placeholder docs (e.g. "_init") that have no date.
+ */
+export const getSessionCount = async (year: string): Promise<number> => {
+  try {
+    const colName = getYearCollectionName('sessions', year);
+    const snap = await getCountFromServer(
+      query(collection(db, colName), where('date', '>=', '0'))
+    );
+    return snap.data().count;
+  } catch (error) {
+    console.error('Error counting sessions:', error);
+    return 0;
+  }
 };
