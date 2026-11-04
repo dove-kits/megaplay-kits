@@ -1,4 +1,4 @@
-//// lib/services/studentService.ts
+// lib/services/studentService.ts
 import {
   doc,
   setDoc,
@@ -8,12 +8,14 @@ import {
   query,
   where,
   getDocs,
+  getCountFromServer,
   deleteDoc,
   writeBatch,
   Timestamp,
 } from 'firebase/firestore';
 import { db } from '../firebase/config';
 import { getAppSettings, getYearCollectionName } from './settingsService';
+import { TTLCache } from '../utils/ttlCache';
 
 export interface Student {
   regno: string;
@@ -50,6 +52,24 @@ type BulkResult = { success: number; failed: number; errors: string[] };
 
 // Firestore allows 500 operations per batch; stay safely below.
 const BATCH_LIMIT = 450;
+
+/**
+ * Cache for getAllStudents (500 reads per call otherwise).
+ * Keyed by year, lives in module memory (per browser tab), 30 minute TTL.
+ * Every function in this file that changes student data clears it.
+ */
+const STUDENTS_CACHE_TTL_MS = 30 * 60 * 1000;
+const studentsCache = new TTLCache<Student[]>(STUDENTS_CACHE_TTL_MS);
+
+/**
+ * Clear the cached student list for a year.
+ * Exported so pages that write to the students collection directly
+ * (e.g. the admin search page's handleSaveEdit using updateDoc) can
+ * invalidate the cache.
+ */
+export const clearStudentsCache = (year: string): void => {
+  if (year) studentsCache.delete(year);
+};
 
 const getCurrentYear = async (): Promise<string | null> => {
   const settings = await getAppSettings(); // cached, usually 0 reads
@@ -120,6 +140,7 @@ export const registerStudent = async (
     };
 
     await setDoc(ref, student);
+    clearStudentsCache(year);
     return { success: true };
   } catch (error) {
     console.error('❌ Error registering student:', error);
@@ -157,9 +178,6 @@ const normalizeStudent = (
 /**
  * Add or update ONE student (superadmin).
  * Pass `yearOverride` if the caller already knows the year.
- *
- * FIX: previously read doc 'settings/appSettings' (wrong path) on every call.
- * Now uses the cached getAppSettings().
  */
 export const addOrUpdateStudent = async (
   studentData: Student,
@@ -188,6 +206,7 @@ export const addOrUpdateStudent = async (
     );
 
     await setDoc(ref, student, { merge: true });
+    clearStudentsCache(currentYear);
     return { success: true };
   } catch (error) {
     console.error('❌ Error adding/updating student:', error);
@@ -198,10 +217,9 @@ export const addOrUpdateStudent = async (
 /**
  * Bulk upload (shared implementation).
  *
- * Before: per row = 1 settings read + 1 student read + 1 write, sequential.
- * Now:    settings read once (cached), ONE collection read to preserve
- *         `appliedAt` of existing students (a fresh year has ~0 docs),
- *         then writes in batches of up to 450.
+ * Settings read once (cached), ONE collection read to preserve `appliedAt`
+ * of existing students (a fresh year has ~0 docs), then writes in batches
+ * of up to 450.
  */
 const runBulkUpload = async (
   rows: any[],
@@ -269,21 +287,26 @@ const runBulkUpload = async (
   let processed = failed;
   report(processed);
 
-  for (let i = 0; i < prepared.length; i += BATCH_LIMIT) {
-    const chunk = prepared.slice(i, i + BATCH_LIMIT);
-    try {
-      const batch = writeBatch(db);
-      chunk.forEach(({ regno, data }) => {
-        batch.set(doc(db, colName, regno), data, { merge: true });
-      });
-      await batch.commit();
-      success += chunk.length;
-    } catch (error: any) {
-      failed += chunk.length;
-      errors.push(`Rows in batch ${Math.floor(i / BATCH_LIMIT) + 1}: ${error?.message || 'Batch failed'}`);
+  try {
+    for (let i = 0; i < prepared.length; i += BATCH_LIMIT) {
+      const chunk = prepared.slice(i, i + BATCH_LIMIT);
+      try {
+        const batch = writeBatch(db);
+        chunk.forEach(({ regno, data }) => {
+          batch.set(doc(db, colName, regno), data, { merge: true });
+        });
+        await batch.commit();
+        success += chunk.length;
+      } catch (error: any) {
+        failed += chunk.length;
+        errors.push(`Rows in batch ${Math.floor(i / BATCH_LIMIT) + 1}: ${error?.message || 'Batch failed'}`);
+      }
+      processed += chunk.length;
+      report(processed);
     }
-    processed += chunk.length;
-    report(processed);
+  } finally {
+    // Some batches may have committed even if a later one failed.
+    clearStudentsCache(year);
   }
 
   return { success, failed, errors };
@@ -318,7 +341,7 @@ export const getStudentByRegno = async (
 };
 
 /**
- * Get student by email address
+ * Get student by email address (1 read: the query returns at most 1 doc)
  */
 export const getStudentByEmail = async (
   year: string,
@@ -371,7 +394,9 @@ export const getStudentsByCommittee = async (
 };
 
 /**
- * Get count of pending students for a committee
+ * Get count of pending students for a committee.
+ * Uses a COUNT aggregation (about 1 read per 1,000 index entries) instead of
+ * reading every pending document.
  */
 export const getPendingCountByCommittee = async (
   year: string,
@@ -387,8 +412,8 @@ export const getPendingCountByCommittee = async (
       where('status', '==', 'pending')
     );
 
-    const snapshot = await getDocs(q);
-    return snapshot.size;
+    const snapshot = await getCountFromServer(q);
+    return snapshot.data().count;
   } catch (error) {
     console.error('Error getting pending count:', error);
     return 0;
@@ -424,6 +449,7 @@ export const updateStudentStatus = async (
     }
 
     await setDoc(ref, updateData, { merge: true });
+    clearStudentsCache(year);
     return { success: true };
   } catch (error) {
     console.error('Error updating student status:', error);
@@ -432,22 +458,34 @@ export const updateStudentStatus = async (
 };
 
 /**
- * Get all students for a year (ADMIN ONLY: costs 1 read per student).
+ * Get all students for a year (ADMIN / COORDINATOR SEARCH ONLY).
+ * Costs 1 read per student on a cache miss, 0 reads on a cache hit.
  * Never call this from student-facing pages.
+ *
+ * @param force  true = skip the cache and re-read from Firestore
+ *               (use for Refresh buttons)
  */
-export const getAllStudents = async (year: string): Promise<Student[]> => {
+export const getAllStudents = async (year: string, force = false): Promise<Student[]> => {
   try {
     if (!year) {
       console.error('Missing year');
       return [];
     }
 
+    if (!force) {
+      const cached = studentsCache.get(year);
+      if (cached) return [...cached];
+    }
+
     const colName = getYearCollectionName('students', year);
     const snapshot = await getDocs(collection(db, colName));
     // Skip placeholder docs (older years contain an "_init" doc)
-    return snapshot.docs
+    const list = snapshot.docs
       .filter((d) => d.id !== '_init' && d.id !== 'metadata')
       .map((d) => d.data() as Student);
+
+    studentsCache.set(year, list);
+    return [...list];
   } catch (error) {
     console.error('Error getting all students:', error);
     return [];
@@ -468,6 +506,7 @@ export const deleteStudent = async (
 
     const colName = getYearCollectionName('students', year);
     await deleteDoc(doc(db, colName, regno.toUpperCase()));
+    clearStudentsCache(year);
     return { success: true };
   } catch (error) {
     console.error('Error deleting student:', error);
@@ -494,22 +533,26 @@ export const bulkDeleteStudents = async (
 
   const colName = getYearCollectionName('students', year);
 
-  for (let i = 0; i < regnos.length; i += BATCH_LIMIT) {
-    const chunk = regnos.slice(i, i + BATCH_LIMIT);
-    try {
-      const batch = writeBatch(db);
-      chunk.forEach((regno) => batch.delete(doc(db, colName, regno.toUpperCase())));
-      await batch.commit();
-      success += chunk.length;
-    } catch (error: any) {
-      failed += chunk.length;
-      errors.push(`${chunk[0]}…${chunk[chunk.length - 1]}: ${error?.message || 'Batch failed'}`);
-    }
+  try {
+    for (let i = 0; i < regnos.length; i += BATCH_LIMIT) {
+      const chunk = regnos.slice(i, i + BATCH_LIMIT);
+      try {
+        const batch = writeBatch(db);
+        chunk.forEach((regno) => batch.delete(doc(db, colName, regno.toUpperCase())));
+        await batch.commit();
+        success += chunk.length;
+      } catch (error: any) {
+        failed += chunk.length;
+        errors.push(`${chunk[0]}…${chunk[chunk.length - 1]}: ${error?.message || 'Batch failed'}`);
+      }
 
-    if (onProgress) {
-      const current = Math.min(i + chunk.length, total);
-      onProgress({ current, total, percent: Math.round((current / total) * 100) });
+      if (onProgress) {
+        const current = Math.min(i + chunk.length, total);
+        onProgress({ current, total, percent: Math.round((current / total) * 100) });
+      }
     }
+  } finally {
+    clearStudentsCache(year);
   }
 
   return { success, failed, errors };
