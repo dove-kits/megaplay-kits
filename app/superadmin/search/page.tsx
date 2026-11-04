@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { useAuth } from '@/context/AuthContext';
 import { useRouter } from 'next/navigation';
 import Image from 'next/image';
@@ -10,10 +10,11 @@ import {
   getAllStudents, 
   Student,
 } from '@/lib/services/studentService';
-import { 
-  getAllAttendance, 
-  AttendanceRecord 
+import {
+  getStudentAttendance,
+  AttendanceRecord
 } from '@/lib/services/attendanceService';
+import { getAllSessions, Session } from '@/lib/services/sessionService';
 import { getBaseCommittees, BaseCommittee } from '@/lib/services/committeeService';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
@@ -25,6 +26,7 @@ export default function SuperAdminSearchPage() {
   const router = useRouter();
 
   const [currentYear, setCurrentYear] = useState<string | null>(null);
+const sessionsCacheRef = useRef<Session[] | null>(null);   // <-- add this line
   const [loading, setLoading] = useState(true);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
 
@@ -83,6 +85,7 @@ export default function SuperAdminSearchPage() {
 
   const loadData = useCallback(async () => {
     try {
+      sessionsCacheRef.current = null;
       setLoading(true);
       setError(null);
 
@@ -116,18 +119,15 @@ export default function SuperAdminSearchPage() {
     }
   }, [router]);
 
-  useEffect(() => {
-    if (authLoading) return;
-    if (!user) {
-      router.push('/login');
-      return;
-    }
-    if (!isSuperAdmin(user?.email)) {
-      router.push('/login');
-      return;
-    }
-    loadData();
-  }, [user, authLoading, loadData, router]);
+  const uid = user?.uid;
+const email = user?.email;
+
+useEffect(() => {
+  if (authLoading) return;
+  if (!uid) { router.push('/login'); return; }
+  if (!isSuperAdmin(email)) { router.push('/login'); return; }
+  loadData();
+}, [uid, email, authLoading, loadData, router]);
 
   const getCommitteeName = useCallback((key: string | undefined) => {
     if (!key) return 'Unknown';
@@ -513,43 +513,34 @@ export default function SuperAdminSearchPage() {
   };
 
   const handleViewAttendance = async (student: Student) => {
-    if (!currentYear) return;
+  if (!currentYear) return;
 
-    setSelectedStudent(student);
-    setShowDetailsModal(false);
-    setLoadingAttendance(true);
-    setShowAttendanceModal(true);
+  setSelectedStudent(student);
+  setShowDetailsModal(false);
+  setLoadingAttendance(true);
+  setShowAttendanceModal(true);
 
-    try {
-      const firestore = await import('firebase/firestore');
-      const config = await import('@/lib/firebase/config');
-      
-      const database = config.db;
-      
-      if (!database) {
-        throw new Error('Firebase database not initialized');
-      }
-
-      const sessionsCol = getYearCollectionName('sessions', currentYear);
-      const sessionsSnapshot = await firestore.getDocs(firestore.collection(database, sessionsCol));
-      const totalSessions = sessionsSnapshot.size;
-      setAllSessionsData(sessionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-
-      const allAttendance = await getAllAttendance(currentYear);
-      const studentRecords = (allAttendance || []).filter(
-        (record) => record?.regno === student?.regno
-      );
-      setStudentAttendance(studentRecords);
-    } catch (error) {
-      console.error('Failed to load attendance:', error);
-      setError('Failed to load attendance records.');
-      setTimeout(() => setError(null), 3000);
-      setStudentAttendance([]);
-      setAllSessionsData([]);
-    } finally {
-      setLoadingAttendance(false);
+  try {
+    // Sessions: loaded once and cached (also skips the "_init" doc that
+    // used to be counted as an extra session, which skewed the percentage)
+    if (!sessionsCacheRef.current) {
+      sessionsCacheRef.current = await getAllSessions(currentYear);
     }
-  };
+    setAllSessionsData(sessionsCacheRef.current);
+
+    // Only THIS student's records (was: every record for the whole year)
+    const studentRecords = await getStudentAttendance(currentYear, student.regno);
+    setStudentAttendance(studentRecords);
+  } catch (error) {
+    console.error('Failed to load attendance:', error);
+    setError('Failed to load attendance records.');
+    setTimeout(() => setError(null), 3000);
+    setStudentAttendance([]);
+    setAllSessionsData([]);
+  } finally {
+    setLoadingAttendance(false);
+  }
+};
 
   const handleLogout = async () => {
     if (isLoggingOut) return;
