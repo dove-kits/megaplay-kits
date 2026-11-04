@@ -3,12 +3,14 @@ import {
   collection,
   doc,
   getDocs,
+  getCountFromServer,
   query,
   where,
   serverTimestamp,
   getDoc,
   addDoc,
   deleteDoc,
+  writeBatch,
   Timestamp,
   QueryDocumentSnapshot,
   DocumentData,
@@ -50,6 +52,8 @@ export interface StudentValidationResult {
   error?: string;
 }
 
+const BATCH_LIMIT = 450;
+
 // ---------- helpers ----------
 
 const mapAttendanceDoc = (d: QueryDocumentSnapshot<DocumentData>): AttendanceRecord => {
@@ -86,8 +90,6 @@ const toMillis = (ts: any): number => {
 
 /**
  * Validate student (must exist and be approved) - 1 read.
- * FIX: previously used the wrong path `students_${year}`; the app stores
- * students at years/{year}/students.
  */
 export const validateStudent = async (
   regno: string,
@@ -148,6 +150,8 @@ export const checkDuplicateAttendance = async (
 
 /**
  * Mark attendance. Cost: 2 reads (duplicate check + student) and 1 write.
+ * Pass 'auto' to use the student's registered category (scholarship -> scholarship,
+ * otherwise od), so the page doesn't need to read the student itself.
  */
 export async function markAttendance(
   year: string,
@@ -156,7 +160,7 @@ export async function markAttendance(
   sessionDate: string,
   sessionNumber: number,
   regno: string,
-  markedCategory: 'od' | 'scholarship' | 'lab',
+  markedCategory: 'od' | 'scholarship' | 'lab' | 'auto',
   markedBy: string
 ): Promise<{
   success: boolean;
@@ -183,10 +187,10 @@ export async function markAttendance(
     if (!existingSnap.empty) {
       const existingCategory = (existingSnap.docs[0].data() as AttendanceRecord).markedCategory;
 
-      if (existingCategory === markedCategory) {
+      if (markedCategory === 'auto' || existingCategory === markedCategory) {
         return {
           success: false,
-          error: `Student already marked in ${markedCategory.toUpperCase()} for this session`,
+          error: `Student already marked in ${existingCategory.toUpperCase()} for this session`,
         };
       }
 
@@ -210,21 +214,29 @@ export async function markAttendance(
       return { success: false, error: 'Student registration is not approved' };
     }
 
-    // 3. Save
+    // Resolve the category
+    const finalCategory: 'od' | 'scholarship' | 'lab' =
+      markedCategory === 'auto'
+        ? student.category === 'scholarship'
+          ? 'scholarship'
+          : 'od'
+        : markedCategory;
+
+    // 3. Save (fallbacks because Firestore rejects undefined values)
     const attendanceData = {
       sessionId,
       sessionName,
       date: sessionDate,
       sessionNumber,
       regno: regnoUpper,
-      studentName: student.name,
-      email: student.email,
+      studentName: student.name || '',
+      email: student.email || '',
       department: student.department || '',
       hostel: student.hostel || '',
       roomNumber: student.roomNumber || '',
-      registeredCommittee: student.committee,
-      registeredCategory: student.category,
-      markedCategory,
+      registeredCommittee: student.committee || '',
+      registeredCategory: student.category || 'normal',
+      markedCategory: finalCategory,
       markedBy,
       markedAt: serverTimestamp(),
     };
@@ -246,19 +258,30 @@ export async function markAttendance(
 }
 
 /**
- * Get attendance for a session (1 read per record in that session)
+ * Get attendance for a session (1 read per returned record).
+ * With `categories`, only those records are read (one query per category)
+ * instead of reading every record of the session and filtering in JS.
  */
 export const getSessionAttendance = async (
   year: string,
-  sessionId: string
+  sessionId: string,
+  categories?: Array<'od' | 'scholarship' | 'lab'>
 ): Promise<AttendanceRecord[]> => {
   try {
     const colName = getYearCollectionName('attendance', year);
-    const snap = await getDocs(
-      query(collection(db, colName), where('sessionId', '==', sessionId))
-    );
+    const base = collection(db, colName);
 
-    const records = snap.docs.map(mapAttendanceDoc);
+    const queries =
+      categories && categories.length > 0
+        ? categories.map((c) =>
+            query(base, where('sessionId', '==', sessionId), where('markedCategory', '==', c))
+          )
+        : [query(base, where('sessionId', '==', sessionId))];
+
+    const snaps = await Promise.all(queries.map((q) => getDocs(q)));
+    const records = ([] as AttendanceRecord[]).concat(
+      ...snaps.map((s) => s.docs.map(mapAttendanceDoc))
+    );
 
     // Most recently marked first
     records.sort((a, b) => toMillis(b.markedAt) - toMillis(a.markedAt));
@@ -318,6 +341,25 @@ export async function deleteAttendance(year: string, attendanceId: string): Prom
 }
 
 /**
+ * Delete ALL attendance records of one student, in batches.
+ * Returns how many records were deleted.
+ */
+export async function deleteStudentAttendance(year: string, regno: string): Promise<number> {
+  const col = getYearCollectionName('attendance', year);
+  const snap = await getDocs(
+    query(collection(db, col), where('regno', '==', regno.toUpperCase()))
+  );
+
+  for (let i = 0; i < snap.docs.length; i += BATCH_LIMIT) {
+    const batch = writeBatch(db);
+    snap.docs.slice(i, i + BATCH_LIMIT).forEach((d) => batch.delete(d.ref));
+    await batch.commit();
+  }
+
+  return snap.size;
+}
+
+/**
  * Get ALL attendance records for a year.
  * ⚠️ EXPENSIVE: 1 read per record (students × sessions). Use only for
  * full exports / reports, never for per-student or per-session views.
@@ -343,5 +385,30 @@ export async function getAllAttendance(year: string): Promise<AttendanceRecord[]
     return toMillis(b.markedAt) - toMillis(a.markedAt);
   });
 
+  return records;
+}
+
+/**
+ * How many sessions a student attended: COUNT aggregation, ~1 read total
+ * (instead of 1 read per record).
+ */
+export async function getStudentAttendanceCount(year: string, regno: string): Promise<number> {
+  const attendanceCol = getYearCollectionName('attendance', year);
+  const snap = await getCountFromServer(
+    query(collection(db, attendanceCol), where('regno', '==', regno.toUpperCase()))
+  );
+  return snap.data().count;
+}
+
+/**
+ * All attendance records for ONE date (1 read per record of that date).
+ * Use for reports instead of loading the whole year.
+ */
+export async function getAttendanceByDate(year: string, date: string): Promise<AttendanceRecord[]> {
+  const attendanceCol = getYearCollectionName('attendance', year);
+  const snap = await getDocs(query(collection(db, attendanceCol), where('date', '==', date)));
+
+  const records = snap.docs.map(mapAttendanceDoc);
+  records.sort((a, b) => toMillis(b.markedAt) - toMillis(a.markedAt));
   return records;
 }
