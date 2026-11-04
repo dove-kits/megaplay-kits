@@ -326,7 +326,10 @@ export async function getAllAttendance(year: string): Promise<AttendanceRecord[]
   const attendanceCol = getYearCollectionName('attendance', year);
   const snapshot = await getDocs(collection(db, attendanceCol));
 
-  const records = snapshot.docs.map(mapAttendanceDoc);
+  // Skip placeholder docs (older years contain an "_init" doc)
+  const records = snapshot.docs
+    .filter((d) => d.id !== '_init' && d.id !== 'metadata')
+    .map(mapAttendanceDoc);
 
   // Newest date first, then newest marked time
   records.sort((a, b) => {
