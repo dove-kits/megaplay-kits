@@ -5,13 +5,14 @@ import {
   setDoc,
   getDoc,
   getDocs,
-  deleteDoc,
   serverTimestamp,
   query,
   where,
+  writeBatch,
 } from 'firebase/firestore';
 import { db } from '../firebase/config';
 import { getYearCollectionName } from './settingsService';
+import { TTLCache } from '../utils/ttlCache';
 
 export interface Coordinator {
   email: string;
@@ -22,21 +23,31 @@ export interface Coordinator {
   isDeleting?: boolean; // Optional: for UI loading state
 }
 
-// Check if user is coordinator
+const COLLECTION = 'attendance_coordinators';
+const NON_DATA_DOC_IDS = new Set(['metadata', '_init']);
+
+// Role checks run on many pages; cache them briefly (3 min).
+// NOTE: this is a UX optimisation only. Real access control must be enforced
+// by Firestore security rules.
+const roleCache = new TTLCache<boolean>(3 * 60 * 1000);
+const cacheKey = (year: string, email: string) => `${year}:${email.toLowerCase()}`;
+
+// Check if user is coordinator (1 read, then cached)
 export const isCoordinator = async (
   email: string,
   year: string
 ): Promise<boolean> => {
-  try {
-    const colName = getYearCollectionName('attendance_coordinators', year);
-    const ref = doc(db, colName, email.toLowerCase());
-    const snap = await getDoc(ref);
+  const key = cacheKey(year, email);
+  const cached = roleCache.get(key);
+  if (cached !== undefined) return cached;
 
-    if (snap.exists()) {
-      const data = snap.data();
-      return data.isActive === true;
-    }
-    return false;
+  try {
+    const colName = getYearCollectionName(COLLECTION, year);
+    const snap = await getDoc(doc(db, colName, email.toLowerCase()));
+    const result = snap.exists() && snap.data().isActive === true;
+
+    roleCache.set(key, result); // only cache successful lookups
+    return result;
   } catch (error) {
     console.error('Error checking coordinator:', error);
     return false;
@@ -48,12 +59,12 @@ export const getCoordinatorsByYear = async (
   year: string
 ): Promise<Coordinator[]> => {
   try {
-    const colName = getYearCollectionName('attendance_coordinators', year);
+    const colName = getYearCollectionName(COLLECTION, year);
     const snap = await getDocs(collection(db, colName));
 
     const result: Coordinator[] = [];
     snap.forEach((d) => {
-      if (d.id === 'metadata') return;
+      if (NON_DATA_DOC_IDS.has(d.id)) return;
       result.push(d.data() as Coordinator);
     });
 
@@ -71,7 +82,7 @@ export const assignCoordinator = async (
   assignedBy: string
 ): Promise<void> => {
   try {
-    const colName = getYearCollectionName('attendance_coordinators', year);
+    const colName = getYearCollectionName(COLLECTION, year);
     const ref = doc(db, colName, email.toLowerCase());
 
     const data: Coordinator = {
@@ -83,149 +94,92 @@ export const assignCoordinator = async (
     };
 
     await setDoc(ref, data);
-    console.log('✅ Coordinator assigned:', email);
+    roleCache.delete(cacheKey(year, email));
   } catch (error) {
     console.error('❌ Error assigning coordinator:', error);
     throw error;
   }
 };
 
-// Remove coordinator and all associated data
+/**
+ * Remove coordinator and associated data.
+ * All three lookups run in parallel, then everything is applied in ONE
+ * atomic batch (before: 4 sequential steps that could half-complete).
+ */
 export const removeCoordinator = async (
   year: string,
   email: string
 ): Promise<void> => {
   try {
     const emailLower = email.toLowerCase();
-    
-    console.log('🗑️  Starting coordinator removal for:', email);
-    
-    // Step 1: Remove from attendance_coordinators collection
-    const coordinatorColName = getYearCollectionName('attendance_coordinators', year);
-    const coordinatorRef = doc(db, coordinatorColName, emailLower);
-    await deleteDoc(coordinatorRef);
-    console.log('✅ [1/4] Coordinator removed from attendance_coordinators');
 
-    // Step 2: Find and remove student profile(s) by querying email
-    // Student docs use regno as ID, so we must query by email field
-    const studentsColName = getYearCollectionName('students', year);
-    const studentsRef = collection(db, studentsColName);
-    const studentQuery = query(studentsRef, where('email', '==', emailLower));
-    const studentSnapshot = await getDocs(studentQuery);
+    const [studentSnap, yearUserSnap, globalUserSnap] = await Promise.all([
+      // Student docs use regno as ID, so query by the email field
+      getDocs(
+        query(collection(db, getYearCollectionName('students', year)), where('email', '==', emailLower))
+      ),
+      getDocs(
+        query(collection(db, getYearCollectionName('users', year)), where('email', '==', emailLower))
+      ),
+      getDocs(query(collection(db, 'users'), where('email', '==', emailLower))),
+    ]);
 
-    if (!studentSnapshot.empty) {
-      const deletePromises = studentSnapshot.docs.map((docSnap) => {
-        console.log(`   → Deleting student profile: ${docSnap.id}`);
-        return deleteDoc(docSnap.ref);
-      });
-      await Promise.all(deletePromises);
-      console.log(`✅ [2/4] Student profile(s) deleted (${studentSnapshot.size} found)`);
-    } else {
-      console.log('⚠️  [2/4] No student profile found for:', email);
-    }
+    const batch = writeBatch(db);
 
-    // Step 3: Update year-specific users collection
-    const yearUsersColName = getYearCollectionName('users', year);
-    const yearUserQuery = query(
-      collection(db, yearUsersColName),
-      where('email', '==', emailLower)
+    // 1. Coordinator document
+    batch.delete(doc(db, getYearCollectionName(COLLECTION, year), emailLower));
+
+    // 2. Student profile(s)
+    studentSnap.docs.forEach((d) => batch.delete(d.ref));
+
+    // 3 + 4. Reset role on year-specific and global user docs
+    yearUserSnap.docs.forEach((d) => batch.set(d.ref, { role: 'student' }, { merge: true }));
+    globalUserSnap.docs.forEach((d) => batch.set(d.ref, { role: 'student' }, { merge: true }));
+
+    await batch.commit();
+    roleCache.delete(cacheKey(year, email));
+
+    console.log(
+      `✅ Coordinator ${email} removed (students: ${studentSnap.size}, year users: ${yearUserSnap.size}, global users: ${globalUserSnap.size})`
     );
-    const yearUserSnapshot = await getDocs(yearUserQuery);
-
-    if (!yearUserSnapshot.empty) {
-      const updatePromises = yearUserSnapshot.docs.map((docSnap) => {
-        console.log(`   → Updating year user: ${docSnap.id}`);
-        return setDoc(
-          docSnap.ref,
-          {
-            role: 'student',
-            lastLogin: serverTimestamp(),
-          },
-          { merge: true }
-        );
-      });
-      await Promise.all(updatePromises);
-      console.log(`✅ [3/4] Year-specific user role(s) updated (${yearUserSnapshot.size} found)`);
-    } else {
-      console.log('⚠️  [3/4] No year-specific user found for:', email);
-    }
-
-    // Step 4: Update global users collection
-    const globalUserQuery = query(
-      collection(db, 'users'),
-      where('email', '==', emailLower)
-    );
-    const globalUserSnapshot = await getDocs(globalUserQuery);
-
-    if (!globalUserSnapshot.empty) {
-      const globalUpdatePromises = globalUserSnapshot.docs.map((docSnap) => {
-        console.log(`   → Updating global user: ${docSnap.id}`);
-        return setDoc(
-          docSnap.ref,
-          {
-            role: 'student',
-            lastLogin: serverTimestamp(),
-          },
-          { merge: true }
-        );
-      });
-      await Promise.all(globalUpdatePromises);
-      console.log(`✅ [4/4] Global user role(s) updated (${globalUserSnapshot.size} found)`);
-    } else {
-      console.log('⚠️  [4/4] No global user found for:', email);
-    }
-
-    console.log('✨ Coordinator removal completed successfully for:', email);
   } catch (error) {
     console.error('❌ Error removing coordinator:', error);
     throw error;
   }
 };
 
-// Optional: Soft delete (deactivate instead of delete)
+// Soft delete (deactivate instead of delete)
 export const deactivateCoordinator = async (
   year: string,
   email: string
 ): Promise<void> => {
   try {
-    const colName = getYearCollectionName('attendance_coordinators', year);
-    const ref = doc(db, colName, email.toLowerCase());
-    
+    const colName = getYearCollectionName(COLLECTION, year);
     await setDoc(
-      ref,
-      {
-        isActive: false,
-        deactivatedAt: serverTimestamp(),
-      },
+      doc(db, colName, email.toLowerCase()),
+      { isActive: false, deactivatedAt: serverTimestamp() },
       { merge: true }
     );
-    
-    console.log('✅ Coordinator deactivated (soft delete):', email);
+    roleCache.delete(cacheKey(year, email));
   } catch (error) {
     console.error('❌ Error deactivating coordinator:', error);
     throw error;
   }
 };
 
-// Optional: Reactivate a deactivated coordinator
+// Reactivate a deactivated coordinator
 export const reactivateCoordinator = async (
   year: string,
   email: string
 ): Promise<void> => {
   try {
-    const colName = getYearCollectionName('attendance_coordinators', year);
-    const ref = doc(db, colName, email.toLowerCase());
-    
+    const colName = getYearCollectionName(COLLECTION, year);
     await setDoc(
-      ref,
-      {
-        isActive: true,
-        reactivatedAt: serverTimestamp(),
-      },
+      doc(db, colName, email.toLowerCase()),
+      { isActive: true, reactivatedAt: serverTimestamp() },
       { merge: true }
     );
-    
-    console.log('✅ Coordinator reactivated:', email);
+    roleCache.delete(cacheKey(year, email));
   } catch (error) {
     console.error('❌ Error reactivating coordinator:', error);
     throw error;
