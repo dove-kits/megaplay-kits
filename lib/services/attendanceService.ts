@@ -8,7 +8,7 @@ import {
   where,
   serverTimestamp,
   getDoc,
-  addDoc,
+  setDoc,
   deleteDoc,
   writeBatch,
   Timestamp,
@@ -54,7 +54,39 @@ export interface StudentValidationResult {
 
 const BATCH_LIMIT = 450;
 
+/**
+ * Duplicate protection when marking attendance.
+ *
+ * Attendance docs now use a DETERMINISTIC id: `${sessionId}_${REGNO}`.
+ * That makes "one mark per student per session" enforceable without a query.
+ *
+ *  true  (default, safe): read the doc by id before writing.
+ *        Cost per mark = 2 reads (existing-check + student) + 1 write.
+ *        Works with ANY Firestore rules.
+ *
+ *  false (cheapest):      skip the existing-check and just write.
+ *        Cost per mark = 1 read (student) + 1 write.
+ *        ONLY set this to false after your Firestore rules make the
+ *        attendance collection create-only (no `update`), otherwise a repeat
+ *        scan would silently OVERWRITE the earlier record.
+ *        Example rule:
+ *          match /years/{y}/attendance/{id} {
+ *            allow create: if <isCoordinatorOrFaculty>;
+ *            allow delete: if <isCoordinatorOrFaculty>;
+ *            allow read:   if <staff> || resource.data.regno == <own regno>;
+ *          }
+ *        A repeat mark then fails with `permission-denied`, handled below.
+ *
+ * Note: records created BEFORE this change have auto-generated ids, so a
+ * duplicate against those old records is not detected. Deploy between days.
+ */
+const CHECK_EXISTING_BEFORE_WRITE = true;
+
 // ---------- helpers ----------
+
+/** Deterministic attendance doc id: one doc per student per session. */
+export const attendanceDocId = (sessionId: string, regno: string): string =>
+  `${sessionId}_${regno.trim().toUpperCase()}`;
 
 const mapAttendanceDoc = (d: QueryDocumentSnapshot<DocumentData>): AttendanceRecord => {
   const data = d.data();
@@ -126,7 +158,9 @@ export const validateStudent = async (
 };
 
 /**
- * Check if student already marked in session
+ * Check if student already marked in session (1 read).
+ * Looks up the deterministic id first; falls back to the old query so
+ * records created before the id change are still found.
  */
 export const checkDuplicateAttendance = async (
   year: string,
@@ -135,6 +169,10 @@ export const checkDuplicateAttendance = async (
 ): Promise<boolean> => {
   try {
     const colName = getYearCollectionName('attendance', year);
+
+    const byId = await getDoc(doc(db, colName, attendanceDocId(sessionId, regno)));
+    if (byId.exists()) return true;
+
     const q = query(
       collection(db, colName),
       where('sessionId', '==', sessionId),
@@ -149,9 +187,15 @@ export const checkDuplicateAttendance = async (
 };
 
 /**
- * Mark attendance. Cost: 2 reads (duplicate check + student) and 1 write.
- * Pass 'auto' to use the student's registered category (scholarship -> scholarship,
- * otherwise od), so the page doesn't need to read the student itself.
+ * Mark attendance.
+ *
+ * Cost: 1 write, plus
+ *   - CHECK_EXISTING_BEFORE_WRITE = true : 2 reads (existing-check + student)
+ *   - CHECK_EXISTING_BEFORE_WRITE = false: 1 read  (student)
+ *
+ * Pass 'auto' to use the student's registered category (scholarship ->
+ * scholarship, otherwise od), so the calling page does not need to read the
+ * student itself.
  */
 export async function markAttendance(
   year: string,
@@ -172,32 +216,31 @@ export async function markAttendance(
       return { success: false, error: 'Session date is required' };
     }
 
-    const regnoUpper = regno.toUpperCase();
+    const regnoUpper = regno.trim().toUpperCase();
     const attendanceCol = getYearCollectionName('attendance', year);
+    const attendanceId = attendanceDocId(sessionId, regnoUpper);
+    const attendanceRef = doc(db, attendanceCol, attendanceId);
 
     // 1. Already marked in THIS session (any category)?
-    const existingSnap = await getDocs(
-      query(
-        collection(db, attendanceCol),
-        where('sessionId', '==', sessionId),
-        where('regno', '==', regnoUpper)
-      )
-    );
+    if (CHECK_EXISTING_BEFORE_WRITE) {
+      const existingSnap = await getDoc(attendanceRef);
 
-    if (!existingSnap.empty) {
-      const existingCategory = (existingSnap.docs[0].data() as AttendanceRecord).markedCategory;
+      if (existingSnap.exists()) {
+        const existingCategory =
+          (existingSnap.data() as AttendanceRecord).markedCategory || 'od';
 
-      if (markedCategory === 'auto' || existingCategory === markedCategory) {
+        if (markedCategory === 'auto' || existingCategory === markedCategory) {
+          return {
+            success: false,
+            error: `Student already marked in ${existingCategory.toUpperCase()} for this session`,
+          };
+        }
+
         return {
           success: false,
-          error: `Student already marked in ${existingCategory.toUpperCase()} for this session`,
+          error: `Student already marked in ${existingCategory.toUpperCase()} for this session. Cannot mark in ${markedCategory.toUpperCase()}. Delete the existing entry first.`,
         };
       }
-
-      return {
-        success: false,
-        error: `Student already marked in ${existingCategory.toUpperCase()} for this session. Cannot mark in ${markedCategory.toUpperCase()}. Delete the existing entry first.`,
-      };
     }
 
     // 2. Student must exist and be approved
@@ -241,17 +284,21 @@ export async function markAttendance(
       markedAt: serverTimestamp(),
     };
 
-    const docRef = await addDoc(collection(db, attendanceCol), attendanceData);
+    await setDoc(attendanceRef, attendanceData);
 
     return {
       success: true,
       record: {
         ...attendanceData,
-        attendanceId: docRef.id,
+        attendanceId,
         markedAt: Timestamp.now(),
       } as AttendanceRecord,
     };
-  } catch (error) {
+  } catch (error: any) {
+    // With create-only rules, a repeat mark is rejected by Firestore.
+    if (!CHECK_EXISTING_BEFORE_WRITE && error?.code === 'permission-denied') {
+      return { success: false, error: 'Student already marked for this session' };
+    }
     console.error('❌ Error marking attendance:', error);
     return { success: false, error: 'Failed to mark attendance' };
   }
@@ -329,6 +376,61 @@ export const getStudentAttendance = async (
 };
 
 /**
+ * ONE student's attendance for specific dates only
+ * (1 read per matching record, NOT per record of the whole year).
+ * Use this for the student attendance page ("latest 2 days" + dropdown).
+ *
+ * Needs a composite index on the attendance collection:
+ *   regno (Ascending) + date (Ascending)
+ * The first run prints a console link that creates it.
+ *
+ * Firestore's `in` operator allows 30 values, so longer lists are chunked.
+ */
+export const getStudentAttendanceByDates = async (
+  year: string,
+  regno: string,
+  dates: string[]
+): Promise<AttendanceRecord[]> => {
+  const uniqueDates = Array.from(new Set(dates.filter(Boolean)));
+  if (uniqueDates.length === 0) return [];
+
+  try {
+    const colName = getYearCollectionName('attendance', year);
+    const regnoUpper = regno.toUpperCase();
+
+    const chunks: string[][] = [];
+    for (let i = 0; i < uniqueDates.length; i += 30) {
+      chunks.push(uniqueDates.slice(i, i + 30));
+    }
+
+    const snaps = await Promise.all(
+      chunks.map((chunk) =>
+        getDocs(
+          query(
+            collection(db, colName),
+            where('regno', '==', regnoUpper),
+            where('date', 'in', chunk)
+          )
+        )
+      )
+    );
+
+    const records = ([] as AttendanceRecord[]).concat(
+      ...snaps.map((s) => s.docs.map(mapAttendanceDoc))
+    );
+
+    records.sort((a, b) => {
+      const byDate = b.date.localeCompare(a.date);
+      return byDate !== 0 ? byDate : a.sessionNumber - b.sessionNumber;
+    });
+    return records;
+  } catch (error) {
+    console.error('Error getting student attendance by dates:', error);
+    return [];
+  }
+};
+
+/**
  * Delete attendance record
  */
 export async function deleteAttendance(year: string, attendanceId: string): Promise<void> {
@@ -361,8 +463,10 @@ export async function deleteStudentAttendance(year: string, regno: string): Prom
 
 /**
  * Get ALL attendance records for a year.
- * ⚠️ EXPENSIVE: 1 read per record (students × sessions). Use only for
- * full exports / reports, never for per-student or per-session views.
+ * ⚠️ VERY EXPENSIVE: 1 read per record (students × sessions, hundreds of
+ * thousands late in the term). Use ONLY for deliberate full-year exports by
+ * an admin. NEVER call it from student or coordinator pages, and never from
+ * a page that loads automatically.
  */
 export async function getAllAttendance(year: string): Promise<AttendanceRecord[]> {
   const attendanceCol = getYearCollectionName('attendance', year);
