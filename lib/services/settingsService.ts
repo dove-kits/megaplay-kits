@@ -1,31 +1,30 @@
 // lib/services/settingsService.ts
-import { 
-  doc, 
-  getDoc, 
-  setDoc, 
-  updateDoc, 
+import {
+  doc,
+  getDoc,
+  setDoc,
+  updateDoc,
   serverTimestamp,
-  Timestamp 
+  Timestamp,
 } from 'firebase/firestore';
 import { db } from '../firebase/config';
 
 /**
  * App-wide settings interface
- * Manages global configuration across the application
  */
 export interface AppSettings {
   // Year management
   currentYear: string;
   availableYears: string[];
-  
+
   // Registration control
   registrationOpen: boolean;
-  
+
   // Committee and organizational data
   activeCommittees: string[];
   departments: string[];
   hostels: string[];
-  
+
   // Metadata
   isInitialized: boolean;
   lastModifiedBy?: string;
@@ -39,108 +38,130 @@ const DEFAULT_DEPARTMENTS = ['CSE', 'ECE', 'MECH', 'EEE', 'CIVIL', 'IT'];
 const DEFAULT_HOSTELS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'Ladies'];
 
 /**
- * Remove undefined values from an object
- * Firestore doesn't accept undefined values
+ * Remove undefined values from an object (Firestore rejects undefined)
  */
 const removeUndefined = <T extends Record<string, any>>(obj: T): Partial<T> => {
   const cleaned: any = {};
-  Object.keys(obj).forEach(key => {
-    if (obj[key] !== undefined) {
-      cleaned[key] = obj[key];
-    }
+  Object.keys(obj).forEach((key) => {
+    if (obj[key] !== undefined) cleaned[key] = obj[key];
   });
   return cleaned;
 };
 
+const withModifier = (
+  data: Partial<AppSettings>,
+  modifiedBy?: string
+): Partial<AppSettings> => (modifiedBy ? { ...data, lastModifiedBy: modifiedBy } : data);
+
+const sortYearsDesc = (years: string[]) => [...years].sort((a, b) => b.localeCompare(a));
+
+// ===========================
+// CACHE (biggest read saver)
+// ===========================
+// Settings are read on every page / every login. They change rarely, so we
+// keep them in memory for a few minutes and share one in-flight request
+// between callers (this also neutralises React Strict Mode double effects).
+const SETTINGS_TTL_MS = 5 * 60 * 1000;
+let settingsCache: { data: AppSettings | null; at: number } | null = null;
+let settingsInFlight: Promise<AppSettings | null> | null = null;
+
+export const clearSettingsCache = () => {
+  settingsCache = null;
+  settingsInFlight = null;
+};
+
 /**
- * Get app settings from Firestore
- * @returns AppSettings or null if document doesn't exist
+ * Get app settings (cached for 5 minutes).
+ * @param force - bypass the cache (use for admin read-modify-write operations)
  */
-export const getAppSettings = async (): Promise<AppSettings | null> => {
-  try {
-    const settingsRef = doc(db, SETTINGS_DOC_PATH);
-    const settingsSnap = await getDoc(settingsRef);
-
-    if (settingsSnap.exists()) {
-      return settingsSnap.data() as AppSettings;
+export const getAppSettings = async (force = false): Promise<AppSettings | null> => {
+  if (!force) {
+    if (settingsCache && Date.now() - settingsCache.at < SETTINGS_TTL_MS) {
+      return settingsCache.data;
     }
-
-    console.warn('⚠️ App settings document does not exist');
-    return null;
-  } catch (error) {
-    console.error('❌ Error getting app settings:', error);
-    throw new Error('Failed to retrieve app settings');
+    if (settingsInFlight) return settingsInFlight;
   }
+
+  const request = (async () => {
+    try {
+      const snap = await getDoc(doc(db, SETTINGS_DOC_PATH));
+      const data = snap.exists() ? (snap.data() as AppSettings) : null;
+      if (!data) console.warn('⚠️ App settings document does not exist');
+      settingsCache = { data, at: Date.now() };
+      return data;
+    } catch (error) {
+      console.error('❌ Error getting app settings:', error);
+      throw new Error('Failed to retrieve app settings');
+    } finally {
+      settingsInFlight = null;
+    }
+  })();
+
+  settingsInFlight = request;
+  return request;
+};
+
+const buildDefaultSettings = (updates: Partial<AppSettings>) => {
+  const fallbackYear = updates.currentYear || new Date().getFullYear().toString();
+  const defaults: any = {
+    currentYear: fallbackYear,
+    availableYears: updates.availableYears || [fallbackYear],
+    registrationOpen: updates.registrationOpen ?? false,
+    activeCommittees: updates.activeCommittees || [],
+    departments: updates.departments || DEFAULT_DEPARTMENTS,
+    hostels: updates.hostels || DEFAULT_HOSTELS,
+    isInitialized: updates.isInitialized ?? true,
+  };
+  if (updates.lastModifiedBy) defaults.lastModifiedBy = updates.lastModifiedBy;
+  return defaults;
 };
 
 /**
  * Create initial app settings (ONLY for first-time setup)
- * @param year - Initial year to set
- * @param modifiedBy - User ID of the person creating settings (optional)
- * @returns Created AppSettings object
  */
 export const createAppSettings = async (
   year: string,
   modifiedBy?: string
 ): Promise<AppSettings> => {
   try {
-    // Check if settings already exist
-    const existingSettings = await getAppSettings();
-    
-    if (existingSettings && existingSettings.isInitialized) {
-      console.log('⚠️ Settings already exist, updating current year only');
-      
-      // Safely check if year exists in availableYears
-      const availableYears = existingSettings.availableYears || [];
-      const updatedAvailableYears = availableYears.includes(year)
+    const existing = await getAppSettings(true);
+
+    if (existing && existing.isInitialized) {
+      const availableYears = existing.availableYears || [];
+      const updatedYears = availableYears.includes(year)
         ? availableYears
-        : [...availableYears, year].sort((a, b) => b.localeCompare(a));
-      
-      const updateData: Partial<AppSettings> = {
+        : sortYearsDesc([...availableYears, year]);
+
+      await updateAppSettings(
+        withModifier(
+          { currentYear: year, availableYears: updatedYears, isInitialized: true },
+          modifiedBy
+        )
+      );
+
+      return {
+        ...existing,
         currentYear: year,
-        availableYears: updatedAvailableYears,
-        isInitialized: true,
-      };
-      
-      if (modifiedBy) {
-        updateData.lastModifiedBy = modifiedBy;
-      }
-      
-      await updateAppSettings(updateData);
-      
-      return { 
-        ...existingSettings, 
-        currentYear: year, 
-        availableYears: updatedAvailableYears,
+        availableYears: updatedYears,
         isInitialized: true,
         ...(modifiedBy && { lastModifiedBy: modifiedBy }),
       };
     }
 
-    // Create new settings if they don't exist
     const newSettings: any = {
-      currentYear: year,
-      availableYears: [year],
+      ...buildDefaultSettings({ currentYear: year, availableYears: [year], lastModifiedBy: modifiedBy }),
       registrationOpen: false,
-      activeCommittees: [],
-      departments: DEFAULT_DEPARTMENTS,
-      hostels: DEFAULT_HOSTELS,
-      isInitialized: true,
       createdAt: Timestamp.now(),
       lastModifiedAt: Timestamp.now(),
     };
-    
-    if (modifiedBy) {
-      newSettings.lastModifiedBy = modifiedBy;
-    }
 
-    const settingsRef = doc(db, SETTINGS_DOC_PATH);
-    await setDoc(settingsRef, {
+    await setDoc(doc(db, SETTINGS_DOC_PATH), {
       ...newSettings,
       createdAt: serverTimestamp(),
       lastModifiedAt: serverTimestamp(),
     });
 
+    clearSettingsCache();
     console.log('✅ Created new app settings for year:', year);
     return newSettings as AppSettings;
   } catch (error) {
@@ -150,53 +171,36 @@ export const createAppSettings = async (
 };
 
 /**
- * Update app settings (use for all updates after creation)
- * @param updates - Partial AppSettings to update
- * @returns Success status and optional error message
+ * Update app settings.
+ * Previously this did a getDoc + write (2 operations). Now it is a single
+ * write; it only creates the document with defaults if it doesn't exist.
  */
 export const updateAppSettings = async (
   updates: Partial<AppSettings>
 ): Promise<{ success: boolean; error?: string }> => {
   try {
     const settingsRef = doc(db, SETTINGS_DOC_PATH);
-    const settingsSnap = await getDoc(settingsRef);
-
-    // Remove undefined values to prevent Firestore errors
     const cleanedUpdates = removeUndefined({
       ...updates,
       lastModifiedAt: serverTimestamp(),
     });
 
-    if (settingsSnap.exists()) {
-      // Update existing settings
+    try {
       await updateDoc(settingsRef, cleanedUpdates);
-      console.log('✅ App settings updated:', Object.keys(updates));
-    } else {
-      // Create new settings if document doesn't exist
-      const defaultSettings: any = {
-        currentYear: updates.currentYear || new Date().getFullYear().toString(),
-        availableYears: updates.availableYears || [updates.currentYear || new Date().getFullYear().toString()],
-        registrationOpen: updates.registrationOpen ?? false,
-        activeCommittees: updates.activeCommittees || [],
-        departments: updates.departments || DEFAULT_DEPARTMENTS,
-        hostels: updates.hostels || DEFAULT_HOSTELS,
-        isInitialized: updates.isInitialized ?? true,
-        createdAt: Timestamp.now(),
-        lastModifiedAt: Timestamp.now(),
-      };
-      
-      if (updates.lastModifiedBy) {
-        defaultSettings.lastModifiedBy = updates.lastModifiedBy;
-      }
+    } catch (err: any) {
+      if (err?.code !== 'not-found') throw err;
 
       await setDoc(settingsRef, {
-        ...defaultSettings,
+        ...buildDefaultSettings(updates),
         createdAt: serverTimestamp(),
         lastModifiedAt: serverTimestamp(),
       });
       console.log('✅ Created new settings document with updates');
     }
 
+    // Invalidate so this tab immediately sees the new values.
+    // (Other devices pick the change up within the 5 minute TTL.)
+    clearSettingsCache();
     return { success: true };
   } catch (error) {
     console.error('❌ Error updating app settings:', error);
@@ -209,397 +213,191 @@ export const updateAppSettings = async (
 
 /**
  * Update only the current year
- * @param year - Year to set as current
- * @param modifiedBy - User ID (optional)
  */
 export const updateCurrentYear = async (
   year: string,
   modifiedBy?: string
 ): Promise<{ success: boolean; error?: string }> => {
   try {
-    const settings = await getAppSettings();
-    
+    const settings = await getAppSettings(true);
     const existingYears = settings?.availableYears || [];
     const availableYears = existingYears.includes(year)
       ? existingYears
-      : [...existingYears, year].sort((a, b) => b.localeCompare(a));
+      : sortYearsDesc([...existingYears, year]);
 
-    const updateData: Partial<AppSettings> = {
-      currentYear: year, 
-      availableYears,
-      isInitialized: true,
-    };
-    
-    if (modifiedBy) {
-      updateData.lastModifiedBy = modifiedBy;
-    }
-
-    return await updateAppSettings(updateData);
+    return await updateAppSettings(
+      withModifier({ currentYear: year, availableYears, isInitialized: true }, modifiedBy)
+    );
   } catch (error) {
     console.error('❌ Error updating current year:', error);
-    return {
-      success: false,
-      error: 'Failed to update current year',
-    };
+    return { success: false, error: 'Failed to update current year' };
   }
 };
 
 /**
  * Toggle registration status
- * @param isOpen - Registration open status
- * @param modifiedBy - User ID (optional)
  */
 export const toggleRegistration = async (
   isOpen: boolean,
   modifiedBy?: string
-): Promise<{ success: boolean; error?: string }> => {
-  const updateData: Partial<AppSettings> = {
-    registrationOpen: isOpen,
-  };
-  
-  if (modifiedBy) {
-    updateData.lastModifiedBy = modifiedBy;
-  }
-  
-  return await updateAppSettings(updateData);
-};
+): Promise<{ success: boolean; error?: string }> =>
+  updateAppSettings(withModifier({ registrationOpen: isOpen }, modifiedBy));
 
 /**
  * Activate/update committees
- * @param committees - Array of committee keys
- * @param modifiedBy - User ID (optional)
  */
 export const activateCommittees = async (
   committees: string[],
   modifiedBy?: string
-): Promise<{ success: boolean; error?: string }> => {
-  const updateData: Partial<AppSettings> = {
-    activeCommittees: committees,
-    isInitialized: true,
-  };
-  
-  if (modifiedBy) {
-    updateData.lastModifiedBy = modifiedBy;
-  }
-  
-  return await updateAppSettings(updateData);
-};
+): Promise<{ success: boolean; error?: string }> =>
+  updateAppSettings(
+    withModifier({ activeCommittees: committees, isInitialized: true }, modifiedBy)
+  );
 
 /**
  * Add a new year to available years
- * @param year - Year to add
- * @param modifiedBy - User ID (optional)
  */
 export const addAvailableYear = async (
   year: string,
   modifiedBy?: string
 ): Promise<{ success: boolean; error?: string }> => {
   try {
-    const settings = await getAppSettings();
-    
-    if (!settings) {
-      return { success: false, error: 'Settings not initialized' };
-    }
+    const settings = await getAppSettings(true);
+    if (!settings) return { success: false, error: 'Settings not initialized' };
 
     const existingYears = settings.availableYears || [];
-    
-    if (existingYears.includes(year)) {
-      return { success: true }; // Already exists
-    }
+    if (existingYears.includes(year)) return { success: true };
 
-    const updateData: Partial<AppSettings> = {
-      availableYears: [...existingYears, year].sort((a, b) => b.localeCompare(a)),
-    };
-    
-    if (modifiedBy) {
-      updateData.lastModifiedBy = modifiedBy;
-    }
-
-    return await updateAppSettings(updateData);
+    return await updateAppSettings(
+      withModifier({ availableYears: sortYearsDesc([...existingYears, year]) }, modifiedBy)
+    );
   } catch (error) {
     console.error('❌ Error adding available year:', error);
-    return {
-      success: false,
-      error: 'Failed to add year',
-    };
+    return { success: false, error: 'Failed to add year' };
   }
 };
 
 // ===========================
-// DEPARTMENT CRUD OPERATIONS
+// LIST HELPERS (departments / hostels / committees)
 // ===========================
+type ListKey = 'departments' | 'hostels' | 'activeCommittees';
 
 /**
- * Add a new department
- * @param department - Department name
- * @param modifiedBy - User ID (optional)
+ * Read-modify-write for a list field. `mutate` returns the new list,
+ * or a string which is treated as a validation error.
+ * Always reads fresh data (force) to avoid overwriting with stale cache.
  */
-export const addDepartment = async (
-  department: string,
+const updateList = async (
+  key: ListKey,
+  mutate: (current: string[]) => string[] | string,
+  failureMessage: string,
   modifiedBy?: string
 ): Promise<{ success: boolean; error?: string }> => {
   try {
-    const settings = await getAppSettings();
-    
-    if (!settings) {
-      return { success: false, error: 'Settings not initialized' };
-    }
+    const settings = await getAppSettings(true);
+    if (!settings) return { success: false, error: 'Settings not initialized' };
 
-    const trimmedDept = department.trim();
-    
-    if (!trimmedDept) {
-      return { success: false, error: 'Department name cannot be empty' };
-    }
+    const result = mutate(settings[key] || []);
+    if (typeof result === 'string') return { success: false, error: result };
 
-    const existingDepts = settings.departments || [];
-    
-    if (existingDepts.includes(trimmedDept)) {
-      return { success: false, error: 'Department already exists' };
-    }
-
-    const updateData: Partial<AppSettings> = {
-      departments: [...existingDepts, trimmedDept].sort(),
-    };
-    
-    if (modifiedBy) {
-      updateData.lastModifiedBy = modifiedBy;
-    }
-
-    return await updateAppSettings(updateData);
+    return await updateAppSettings(
+      withModifier({ [key]: result } as Partial<AppSettings>, modifiedBy)
+    );
   } catch (error) {
-    console.error('❌ Error adding department:', error);
-    return {
-      success: false,
-      error: 'Failed to add department',
-    };
+    console.error(`❌ ${failureMessage}:`, error);
+    return { success: false, error: failureMessage };
   }
 };
 
-/**
- * Remove a department
- * @param department - Department name to remove
- * @param modifiedBy - User ID (optional)
- */
-export const removeDepartment = async (
-  department: string,
-  modifiedBy?: string
-): Promise<{ success: boolean; error?: string }> => {
-  try {
-    const settings = await getAppSettings();
-    
-    if (!settings) {
-      return { success: false, error: 'Settings not initialized' };
-    }
-
-    const existingDepts = settings.departments || [];
-
-    const updateData: Partial<AppSettings> = {
-      departments: existingDepts.filter(d => d !== department),
-    };
-    
-    if (modifiedBy) {
-      updateData.lastModifiedBy = modifiedBy;
-    }
-
-    return await updateAppSettings(updateData);
-  } catch (error) {
-    console.error('❌ Error removing department:', error);
-    return {
-      success: false,
-      error: 'Failed to remove department',
-    };
-  }
+// ===========================
+// DEPARTMENT CRUD
+// ===========================
+export const addDepartment = async (department: string, modifiedBy?: string) => {
+  const name = department.trim();
+  return updateList(
+    'departments',
+    (list) => {
+      if (!name) return 'Department name cannot be empty';
+      if (list.includes(name)) return 'Department already exists';
+      return [...list, name].sort();
+    },
+    'Failed to add department',
+    modifiedBy
+  );
 };
 
-/**
- * Update entire departments list
- * @param departments - Array of department names
- * @param modifiedBy - User ID (optional)
- */
+export const removeDepartment = async (department: string, modifiedBy?: string) =>
+  updateList(
+    'departments',
+    (list) => list.filter((d) => d !== department),
+    'Failed to remove department',
+    modifiedBy
+  );
+
 export const updateDepartments = async (
   departments: string[],
   modifiedBy?: string
-): Promise<{ success: boolean; error?: string }> => {
-  const updateData: Partial<AppSettings> = {
-    departments: departments.sort(),
-  };
-  
-  if (modifiedBy) {
-    updateData.lastModifiedBy = modifiedBy;
-  }
-  
-  return await updateAppSettings(updateData);
-};
+): Promise<{ success: boolean; error?: string }> =>
+  updateAppSettings(withModifier({ departments: [...departments].sort() }, modifiedBy));
 
 // ===========================
-// HOSTEL CRUD OPERATIONS
+// HOSTEL CRUD
 // ===========================
-
-/**
- * Add a new hostel
- * @param hostel - Hostel name
- * @param modifiedBy - User ID (optional)
- */
-export const addHostel = async (
-  hostel: string,
-  modifiedBy?: string
-): Promise<{ success: boolean; error?: string }> => {
-  try {
-    const settings = await getAppSettings();
-    
-    if (!settings) {
-      return { success: false, error: 'Settings not initialized' };
-    }
-
-    const trimmedHostel = hostel.trim();
-    
-    if (!trimmedHostel) {
-      return { success: false, error: 'Hostel name cannot be empty' };
-    }
-
-    const existingHostels = settings.hostels || [];
-    
-    if (existingHostels.includes(trimmedHostel)) {
-      return { success: false, error: 'Hostel already exists' };
-    }
-
-    const updateData: Partial<AppSettings> = {
-      hostels: [...existingHostels, trimmedHostel].sort(),
-    };
-    
-    if (modifiedBy) {
-      updateData.lastModifiedBy = modifiedBy;
-    }
-
-    return await updateAppSettings(updateData);
-  } catch (error) {
-    console.error('❌ Error adding hostel:', error);
-    return {
-      success: false,
-      error: 'Failed to add hostel',
-    };
-  }
+export const addHostel = async (hostel: string, modifiedBy?: string) => {
+  const name = hostel.trim();
+  return updateList(
+    'hostels',
+    (list) => {
+      if (!name) return 'Hostel name cannot be empty';
+      if (list.includes(name)) return 'Hostel already exists';
+      return [...list, name].sort();
+    },
+    'Failed to add hostel',
+    modifiedBy
+  );
 };
 
-/**
- * Remove a hostel
- * @param hostel - Hostel name to remove
- * @param modifiedBy - User ID (optional)
- */
-export const removeHostel = async (
-  hostel: string,
-  modifiedBy?: string
-): Promise<{ success: boolean; error?: string }> => {
-  try {
-    const settings = await getAppSettings();
-    
-    if (!settings) {
-      return { success: false, error: 'Settings not initialized' };
-    }
+export const removeHostel = async (hostel: string, modifiedBy?: string) =>
+  updateList(
+    'hostels',
+    (list) => list.filter((h) => h !== hostel),
+    'Failed to remove hostel',
+    modifiedBy
+  );
 
-    const existingHostels = settings.hostels || [];
-
-    const updateData: Partial<AppSettings> = {
-      hostels: existingHostels.filter(h => h !== hostel),
-    };
-    
-    if (modifiedBy) {
-      updateData.lastModifiedBy = modifiedBy;
-    }
-
-    return await updateAppSettings(updateData);
-  } catch (error) {
-    console.error('❌ Error removing hostel:', error);
-    return {
-      success: false,
-      error: 'Failed to remove hostel',
-    };
-  }
-};
-
-/**
- * Update entire hostels list
- * @param hostels - Array of hostel names
- * @param modifiedBy - User ID (optional)
- */
 export const updateHostels = async (
   hostels: string[],
   modifiedBy?: string
-): Promise<{ success: boolean; error?: string }> => {
-  const updateData: Partial<AppSettings> = {
-    hostels: hostels.sort(),
-  };
-  
-  if (modifiedBy) {
-    updateData.lastModifiedBy = modifiedBy;
-  }
-  
-  return await updateAppSettings(updateData);
-};
+): Promise<{ success: boolean; error?: string }> =>
+  updateAppSettings(withModifier({ hostels: [...hostels].sort() }, modifiedBy));
+
+/**
+ * Remove a committee from active committees
+ */
+export const removeActiveCommittee = async (committeeKey: string, modifiedBy?: string) =>
+  updateList(
+    'activeCommittees',
+    (list) => list.filter((k) => k !== committeeKey),
+    'Failed to remove active committee',
+    modifiedBy
+  );
 
 /**
  * Get year-specific collection name
- * @param baseName - Base collection name
- * @param year - Year to append
- * @returns Formatted collection name
  */
-export const getYearCollectionName = (
-  baseName: string,
-  year: string
-): string => {
-  return `years/${year}/${baseName}`;
-};
+export const getYearCollectionName = (baseName: string, year: string): string =>
+  `years/${year}/${baseName}`;
 
 /**
  * Initialize app settings if they don't exist
- * @param year - Initial year
- * @param modifiedBy - User ID (optional)
  */
 export const initializeSettingsIfNeeded = async (
   year?: string,
   modifiedBy?: string
 ): Promise<AppSettings> => {
   const settings = await getAppSettings();
-  
-  if (settings && settings.isInitialized) {
-    return settings;
-  }
+  if (settings && settings.isInitialized) return settings;
 
   const initialYear = year || new Date().getFullYear().toString();
   return await createAppSettings(initialYear, modifiedBy);
-};
-/**
- * Remove a committee from active committees
- * @param committeeKey - Committee key to remove
- * @param modifiedBy - User ID (optional)
- */
-export const removeActiveCommittee = async (
-  committeeKey: string,
-  modifiedBy?: string
-): Promise<{ success: boolean; error?: string }> => {
-  try {
-    const settings = await getAppSettings();
-    
-    if (!settings) {
-      return { success: false, error: 'Settings not initialized' };
-    }
-
-    const existingCommittees = settings.activeCommittees || [];
-
-    const updateData: Partial<AppSettings> = {
-      activeCommittees: existingCommittees.filter(k => k !== committeeKey),
-    };
-    
-    if (modifiedBy) {
-      updateData.lastModifiedBy = modifiedBy;
-    }
-
-    return await updateAppSettings(updateData);
-  } catch (error) {
-    console.error('❌ Error removing active committee:', error);
-    return {
-      success: false,
-      error: 'Failed to remove active committee',
-    };
-  }
 };
