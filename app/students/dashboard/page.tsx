@@ -5,12 +5,15 @@ import { useAuth } from '../../../context/AuthContext';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import Image from 'next/image';
-import { getAppSettings } from '@/lib/services/settingsService';
-import { getStudentByEmail, Student } from '@/lib/services/studentService';
-import { getCommitteesForYear } from '@/lib/services/committeeService';
-import { collection, query, getDocs } from 'firebase/firestore';
+import { doc, getDoc } from 'firebase/firestore';
 import { db } from '@/lib/firebase/config';
-import { getYearCollectionName } from '@/lib/services/settingsService';
+import { getAppSettings, getYearCollectionName } from '@/lib/services/settingsService';
+import { getStudentByEmail, Student } from '@/lib/services/studentService';
+import {
+  getSessionsSummary,
+  getTotalSessionsFromSummary,
+} from '@/lib/services/sessionService';
+import { getStudentAttendanceCount } from '@/lib/services/attendanceService';
 
 interface AttendanceStats {
   presentHours: number;
@@ -42,8 +45,14 @@ export default function StudentDashboard() {
       return;
     }
     loadDashboardData();
-  }, [user, authLoading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.uid, authLoading]);
 
+  /**
+   * Cost per visit (about 4-5 reads, flat for the whole term):
+   *   settings (cached) 0-1, student 1, summary 1, count ~1, committee 1.
+   * Before: every session + every attendance record of the year.
+   */
   const loadDashboardData = async () => {
     try {
       setLoading(true);
@@ -55,15 +64,16 @@ export default function StudentDashboard() {
         return;
       }
 
-      setCurrentYear(settings.currentYear);
+      const year = settings.currentYear;
+      setCurrentYear(year);
 
       if (!user?.email) {
         router.push('/login');
         return;
       }
 
-      const studentData = await getStudentByEmail(settings.currentYear, user.email);
-      
+      const studentData = await getStudentByEmail(year, user.email);
+
       if (!studentData) {
         alert('Student record not found.');
         router.push('/students');
@@ -77,14 +87,11 @@ export default function StudentDashboard() {
 
       setStudent(studentData);
 
-      if (studentData.committee) {
-        const committees = await getCommitteesForYear(settings.currentYear);
-        const committee = committees.find((c) => c?.key === studentData.committee);
-        setCommitteeName(committee?.name || studentData.committee);
-      }
-
-      await calculateAttendanceStats(settings.currentYear, studentData.regno);
-
+      // Committee name + attendance stats in parallel
+      await Promise.all([
+        loadCommitteeName(year, studentData.committee),
+        calculateAttendanceStats(year, studentData.regno),
+      ]);
     } catch (error) {
       console.error('Failed to load dashboard:', error);
       alert('Failed to load dashboard data.');
@@ -93,28 +100,39 @@ export default function StudentDashboard() {
     }
   };
 
+  // 1 read (the old code read every committee of the year to find one name)
+  const loadCommitteeName = async (year: string, committeeKey?: string) => {
+    if (!committeeKey) return;
+
+    try {
+      const snap = await getDoc(
+        doc(db, getYearCollectionName('committees', year), committeeKey)
+      );
+      const name = snap.exists() ? (snap.data()?.name as string | undefined) : undefined;
+      setCommitteeName(name || committeeKey);
+    } catch (error) {
+      console.error('Failed to load committee:', error);
+      setCommitteeName(committeeKey);
+    }
+  };
+
   const calculateAttendanceStats = async (year: string, regno: string) => {
     try {
-      const sessionsCol = getYearCollectionName('sessions', year);
-      const sessionsSnapshot = await getDocs(collection(db, sessionsCol));
-      const totalSessions = sessionsSnapshot.size;
+      // Summary doc (1 read) = total non-cancelled sessions.
+      // COUNT aggregation (about 1 read) = sessions this student attended.
+      const [summary, presentSessions] = await Promise.all([
+        getSessionsSummary(year),
+        getStudentAttendanceCount(year, regno),
+      ]);
 
-      const attendanceCol = getYearCollectionName('attendance', year);
-      const attendanceSnapshot = await getDocs(
-        query(collection(db, attendanceCol))
-      );
-
-      const studentAttendance = attendanceSnapshot.docs.filter(
-        (doc) => doc.data()?.regno === regno
-      );
-
-      const presentSessions = studentAttendance.length;
-      const absentSessions = totalSessions - presentSessions;
+      const totalSessions = getTotalSessionsFromSummary(summary);
+      const absentSessions = Math.max(0, totalSessions - presentSessions);
 
       const presentHours = presentSessions * 3;
       const totalHours = totalSessions * 3;
       const absentHours = absentSessions * 3;
-      const percentage = totalHours > 0 ? (presentHours / totalHours) * 100 : 0;
+      const percentage =
+        totalHours > 0 ? Math.min(100, (presentHours / totalHours) * 100) : 0;
 
       setAttendanceStats({
         presentHours,
@@ -160,14 +178,14 @@ export default function StudentDashboard() {
     return (
       <div className="min-h-screen flex items-center justify-center relative overflow-hidden bg-[#000000]">
         {/* Background Elements */}
-        <div className="absolute inset-0 bg-gradient-to-br from-[#0a0a0f] via-[#050508] to-[ #02030a]"></div>
+        <div className="absolute inset-0 bg-gradient-to-br from-[#0a0a0f] via-[#050508] to-[#02030a]"></div>
         <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(ellipse_at_top,rgba(59,130,246,0.08),transparent_50%)]"></div>
         <div className="absolute top-20 -left-40 w-80 h-80 bg-blue-500/15 rounded-full blur-[110px] animate-pulse"></div>
         <div className="absolute bottom-20 -right-40 w-80 h-80 bg-purple-500/15 rounded-full blur-[110px] animate-pulse"></div>
         
         <div className="relative z-10 text-center">
           <div className="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-          <p>Loading dashboard...</p>
+          <p className="text-white">Loading dashboard...</p>
         </div>
       </div>
     );
