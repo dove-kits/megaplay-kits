@@ -1,34 +1,22 @@
 'use client';
 
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '../../../../context/AuthContext';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import Image from 'next/image';
 import { getAppSettings } from '@/lib/services/settingsService';
 import { getStudentByEmail, Student } from '@/lib/services/studentService';
-import { collection, query, getDocs, orderBy } from 'firebase/firestore';
-import { db } from '@/lib/firebase/config';
-import { getYearCollectionName } from '@/lib/services/settingsService';
-
-interface Session {
-  id: string;
-  date: string;
-  sessionNumber: number;
-  sessionName: string;
-  startTime?: string;
-  endTime?: string;
-}
-
-interface AttendanceRecord {
-  id: string;
-  regno: string;
-  date: string;
-  sessionNumber: number;
-  sessionName: string;
-  markedCategory: string;
-  timestamp?: any;
-}
+import {
+  getSessionsSummary,
+  getTotalSessionsFromSummary,
+  getSummaryDates,
+  SessionsSummary,
+} from '@/lib/services/sessionService';
+import {
+  getStudentAttendanceByDates,
+  getStudentAttendanceCount,
+} from '@/lib/services/attendanceService';
 
 interface SessionStatus {
   sessionNumber: number;
@@ -40,6 +28,9 @@ interface DateAttendance {
   sessions: SessionStatus[];
 }
 
+// How many dates are shown by default / added by "Load older days"
+const PAGE_SIZE = 2;
+
 export default function StudentAttendancePage() {
   const { user, loading: authLoading, signOut } = useAuth();
   const router = useRouter();
@@ -47,13 +38,23 @@ export default function StudentAttendancePage() {
   const [loading, setLoading] = useState(true);
   const [currentYear, setCurrentYear] = useState<string | null>(null);
   const [student, setStudent] = useState<Student | null>(null);
-  const [allSessions, setAllSessions] = useState<Session[]>([]);
-  const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([]);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
-  
-  // Filters
-  const [dateFilter, setDateFilter] = useState<string>('all');
-  const [searchDate, setSearchDate] = useState<string>('');
+
+  // From the summary doc (1 read): which dates / session numbers exist
+  const [summary, setSummary] = useState<SessionsSummary>({});
+  // From a COUNT query (about 1 read): sessions this student attended
+  const [presentSessions, setPresentSessions] = useState(0);
+
+  // Attendance for the dates that have been loaded so far:
+  // { "2026-11-04": [1, 3, 4] }  (= session numbers attended)
+  const [attendedByDate, setAttendedByDate] = useState<Record<string, number[]>>({});
+  const fetchedDatesRef = useRef<Set<string>>(new Set());
+  const [loadingDates, setLoadingDates] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  // View: latest N dates (default) OR one picked date
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [pickedDate, setPickedDate] = useState<string>('');
 
   useEffect(() => {
     if (authLoading) return;
@@ -61,14 +62,18 @@ export default function StudentAttendancePage() {
       router.push('/login');
       return;
     }
-    loadAttendanceData();
-  }, [user, authLoading]);
+    loadBaseData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.uid, authLoading]);
 
-  const loadAttendanceData = async () => {
+  /**
+   * Base load: student (1) + summary (1) + count (about 1) = about 3 reads.
+   * No session or attendance collection is scanned.
+   */
+  const loadBaseData = async () => {
     try {
       setLoading(true);
 
-      // Get current year and settings
       const settings = await getAppSettings();
       if (!settings?.currentYear) {
         alert('No active year configured.');
@@ -76,23 +81,22 @@ export default function StudentAttendancePage() {
         return;
       }
 
-      setCurrentYear(settings.currentYear);
+      const year = settings.currentYear;
+      setCurrentYear(year);
 
-      // Get student data
       if (!user?.email) {
         router.push('/login');
         return;
       }
 
-      const studentData = await getStudentByEmail(settings.currentYear, user.email);
-      
+      const studentData = await getStudentByEmail(year, user.email);
+
       if (!studentData) {
         alert('Student record not found.');
         router.push('/students/dashboard');
         return;
       }
 
-      // Check if approved
       if (studentData.status !== 'approved') {
         router.push('/students');
         return;
@@ -100,43 +104,13 @@ export default function StudentAttendancePage() {
 
       setStudent(studentData);
 
-      // Get all sessions
-      const sessionsCol = getYearCollectionName('sessions', settings.currentYear);
-      const sessionsSnapshot = await getDocs(
-        query(collection(db, sessionsCol), orderBy('date', 'desc'))
-      );
+      const [summaryData, presentCount] = await Promise.all([
+        getSessionsSummary(year),
+        getStudentAttendanceCount(year, studentData.regno),
+      ]);
 
-      const sessions: Session[] = sessionsSnapshot.docs.map((doc) => ({
-        id: doc.id,
-        date: doc.data()?.date || '',
-        sessionNumber: doc.data()?.sessionNumber || 0,
-        sessionName: doc.data()?.sessionName || '',
-        startTime: doc.data()?.startTime,
-        endTime: doc.data()?.endTime,
-      }));
-
-      setAllSessions(sessions);
-
-      // Get student attendance records
-      const attendanceCol = getYearCollectionName('attendance', settings.currentYear);
-      const attendanceSnapshot = await getDocs(
-        query(collection(db, attendanceCol))
-      );
-
-      const records: AttendanceRecord[] = attendanceSnapshot.docs
-        .filter((doc) => doc.data()?.regno === studentData.regno)
-        .map((doc) => ({
-          id: doc.id,
-          regno: doc.data()?.regno || '',
-          date: doc.data()?.date || '',
-          sessionNumber: doc.data()?.sessionNumber || 0,
-          sessionName: doc.data()?.sessionName || '',
-          markedCategory: doc.data()?.markedCategory || '',
-          timestamp: doc.data()?.timestamp,
-        }));
-
-      setAttendanceRecords(records);
-
+      setSummary(summaryData);
+      setPresentSessions(presentCount);
     } catch (error) {
       console.error('Failed to load attendance:', error);
       alert('Failed to load attendance data.');
@@ -159,93 +133,114 @@ export default function StudentAttendancePage() {
     }
   };
 
-  // Get maximum session number across all dates
+  // All dates that have sessions, newest first (0 reads)
+  const allDates = useMemo(() => getSummaryDates(summary), [summary]);
+
+  // Highest session number across all dates = number of grid columns
   const maxSessionNumber = useMemo(() => {
-    if (allSessions.length === 0) return 0;
-    return Math.max(...allSessions.map((s) => s.sessionNumber));
-  }, [allSessions]);
+    let max = 0;
+    Object.values(summary).forEach((list) => {
+      (list || []).forEach((n) => {
+        if (n > max) max = n;
+      });
+    });
+    return max;
+  }, [summary]);
 
-  // Group sessions by date with proper null handling
-  const dateWiseAttendance = useMemo(() => {
-    // Get all unique dates
-    const uniqueDates = Array.from(new Set(allSessions.map((s) => s.date))).sort(
-      (a, b) => new Date(b).getTime() - new Date(a).getTime()
-    );
+  // Dates shown right now
+  const visibleDates = useMemo(
+    () => (pickedDate ? [pickedDate] : allDates.slice(0, visibleCount)),
+    [pickedDate, allDates, visibleCount]
+  );
 
-    const result: DateAttendance[] = [];
+  // Load attendance ONLY for visible dates that were not loaded before.
+  // Cost: about 1 read per attendance record on those dates
+  // (about 6 reads for 2 days at 3 sessions/day, about 12 at 6 sessions/day).
+  useEffect(() => {
+    if (!student || !currentYear) return;
 
-    uniqueDates.forEach((date) => {
-      // Get sessions that existed on this date
-      const dateSessions = allSessions.filter((s) => s.date === date);
-      const existingSessionNumbers = new Set(dateSessions.map((s) => s.sessionNumber));
+    const missing = visibleDates.filter((d) => !fetchedDatesRef.current.has(d));
+    if (missing.length === 0) return;
 
-      // Create session status array for all possible sessions (1 to maxSessionNumber)
-      const sessionStatuses: SessionStatus[] = [];
+    let cancelled = false;
 
-      for (let sessionNum = 1; sessionNum <= maxSessionNumber; sessionNum++) {
-        if (existingSessionNumbers.has(sessionNum)) {
-          // Session existed on this date - check if student attended
-          const attended = attendanceRecords.some(
-            (record) =>
-              record.date === date && record.sessionNumber === sessionNum
+    (async () => {
+      setLoadingDates(true);
+      setLoadError(null);
+      try {
+        const records = await getStudentAttendanceByDates(
+          currentYear,
+          student.regno,
+          missing
+        );
+        if (cancelled) return;
+
+        missing.forEach((d) => fetchedDatesRef.current.add(d));
+
+        setAttendedByDate((prev) => {
+          const next = { ...prev };
+          missing.forEach((d) => {
+            next[d] = [];
+          });
+          records.forEach((r) => {
+            next[r.date] = [...(next[r.date] || []), r.sessionNumber];
+          });
+          return next;
+        });
+      } catch (error) {
+        console.error('Failed to load attendance for dates:', error);
+        // Do NOT mark the dates as fetched, otherwise they would show as Absent.
+        if (!cancelled) {
+          setLoadError(
+            'Could not load attendance for these dates. Please try again in a moment.'
           );
-          sessionStatuses.push({
-            sessionNumber: sessionNum,
-            present: attended,
-          });
+        }
+      } finally {
+        if (!cancelled) setLoadingDates(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [visibleDates, student, currentYear]);
+
+  // Rows for the grid
+  const dateWiseAttendance = useMemo(() => {
+    const rows: DateAttendance[] = [];
+
+    visibleDates.forEach((date) => {
+      // Not loaded yet: skip, so nothing shows as Absent by mistake
+      if (!fetchedDatesRef.current.has(date) || !attendedByDate[date]) return;
+
+      const existing = new Set(summary[date] || []);
+      const attended = new Set(attendedByDate[date] || []);
+
+      const sessions: SessionStatus[] = [];
+      for (let n = 1; n <= maxSessionNumber; n++) {
+        if (existing.has(n)) {
+          sessions.push({ sessionNumber: n, present: attended.has(n) });
         } else {
-          // Session didn't exist on this date - mark as null
-          sessionStatuses.push({
-            sessionNumber: sessionNum,
-            present: null,
-          });
+          sessions.push({ sessionNumber: n, present: null });
         }
       }
 
-      result.push({
-        date,
-        sessions: sessionStatuses,
-      });
+      rows.push({ date, sessions });
     });
 
-    return result;
-  }, [allSessions, attendanceRecords, maxSessionNumber]);
+    return rows;
+  }, [visibleDates, attendedByDate, summary, maxSessionNumber]);
 
-  // Filter by date
-  const filteredAttendance = useMemo(() => {
-    let filtered = [...dateWiseAttendance];
-
-    if (searchDate) {
-      filtered = filtered.filter((item) => item.date.includes(searchDate));
-    }
-
-    if (dateFilter === 'last7') {
-      const sevenDaysAgo = new Date();
-      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-      filtered = filtered.filter(
-        (item) => new Date(item.date) >= sevenDaysAgo
-      );
-    } else if (dateFilter === 'last30') {
-      const thirtyDaysAgo = new Date();
-      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-      filtered = filtered.filter(
-        (item) => new Date(item.date) >= thirtyDaysAgo
-      );
-    }
-
-    return filtered;
-  }, [dateWiseAttendance, dateFilter, searchDate]);
-
-  // Calculate statistics
+  // Statistics (whole term) from the summary total + COUNT query
   const stats = useMemo(() => {
-    const totalSessions = allSessions.length;
-    const presentSessions = attendanceRecords.length;
-    const absentSessions = totalSessions - presentSessions;
+    const totalSessions = getTotalSessionsFromSummary(summary);
+    const absentSessions = Math.max(0, totalSessions - presentSessions);
 
     const presentHours = presentSessions * 3;
     const totalHours = totalSessions * 3;
     const absentHours = absentSessions * 3;
-    const percentage = totalHours > 0 ? (presentHours / totalHours) * 100 : 0;
+    const percentage =
+      totalHours > 0 ? Math.min(100, (presentHours / totalHours) * 100) : 0;
 
     return {
       presentSessions,
@@ -256,7 +251,9 @@ export default function StudentAttendancePage() {
       totalHours,
       percentage: parseFloat(percentage.toFixed(2)),
     };
-  }, [allSessions, attendanceRecords]);
+  }, [summary, presentSessions]);
+
+  const hasOlderDates = !pickedDate && visibleCount < allDates.length;
 
   // Get percentage color
   const getPercentageColor = (percentage: number): string => {
@@ -266,21 +263,18 @@ export default function StudentAttendancePage() {
     return 'text-red-400';
   };
 
-  // Format date for display
-  const formatDate = (dateStr: string): string => {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString('en-IN', {
+  // Parse YYYY-MM-DD as a LOCAL date (new Date('YYYY-MM-DD') is UTC)
+  const parseLocalDate = (dateStr: string): Date => new Date(dateStr + 'T00:00:00');
+
+  const formatDate = (dateStr: string): string =>
+    parseLocalDate(dateStr).toLocaleDateString('en-IN', {
       day: '2-digit',
       month: 'short',
       year: 'numeric',
     });
-  };
 
-  // Get day name
-  const getDayName = (dateStr: string): string => {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString('en-IN', { weekday: 'short' });
-  };
+  const getDayName = (dateStr: string): string =>
+    parseLocalDate(dateStr).toLocaleDateString('en-IN', { weekday: 'short' });
 
   if (authLoading || loading) {
     return (
@@ -293,7 +287,7 @@ export default function StudentAttendancePage() {
         
         <div className="relative z-10 text-center">
           <div className="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-          <p>Loading attendance...</p>
+          <p className="text-white">Loading attendance...</p>
         </div>
       </div>
     );
@@ -491,69 +485,61 @@ export default function StudentAttendancePage() {
               </div>
             </div>
 
-            {/* Filters */}
+            {/* Date Picker */}
             <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl p-6 shadow-2xl">
-              <div className="flex flex-col md:flex-row gap-4">
+              <div className="flex flex-col md:flex-row gap-4 md:items-end">
                 <div className="flex-1">
                   <label className="block text-sm font-medium text-white mb-2">
-                    Search by Date
+                    View a specific date
                   </label>
-                  <input
-                    type="text"
-                    value={searchDate}
-                    onChange={(e) => setSearchDate(e.target.value)}
-                    placeholder="YYYY-MM-DD"
-                    className="w-full bg-white/5 border border-white/20 rounded-2xl px-4 py-3 text-white placeholder-white/40 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  />
+                  <select
+                    value={pickedDate}
+                    onChange={(e) => setPickedDate(e.target.value)}
+                    className="w-full bg-white/5 border border-white/20 rounded-2xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 [&>option]:bg-slate-800 [&>option]:text-white"
+                  >
+                    <option value="">Latest {PAGE_SIZE} days</option>
+                    {allDates.map((date) => (
+                      <option key={date} value={date}>
+                        {formatDate(date)} ({getDayName(date)})
+                      </option>
+                    ))}
+                  </select>
                 </div>
-                <div className="flex-1">
-                  <label className="block text-sm font-medium text-white mb-2">
-                    Date Range
-                  </label>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => setDateFilter('all')}
-                      className={`flex-1 px-4 py-3 rounded-xl text-sm font-medium transition-all ${
-                        dateFilter === 'all'
-                          ? 'bg-indigo-500/20 border border-indigo-400/60 text-indigo-100'
-                          : 'bg-white/5 border border-white/20 text-white/80 hover:bg-white/10'
-                      }`}
-                    >
-                      All
-                    </button>
-                    <button
-                      onClick={() => setDateFilter('last7')}
-                      className={`flex-1 px-4 py-3 rounded-xl text-sm font-medium transition-all ${
-                        dateFilter === 'last7'
-                          ? 'bg-indigo-500/20 border border-indigo-400/60 text-indigo-100'
-                          : 'bg-white/5 border border-white/20 text-white/80 hover:bg-white/10'
-                      }`}
-                    >
-                      Last 7 Days
-                    </button>
-                    <button
-                      onClick={() => setDateFilter('last30')}
-                      className={`flex-1 px-4 py-3 rounded-xl text-sm font-medium transition-all ${
-                        dateFilter === 'last30'
-                          ? 'bg-indigo-500/20 border border-indigo-400/60 text-indigo-100'
-                          : 'bg-white/5 border border-white/20 text-white/80 hover:bg-white/10'
-                      }`}
-                    >
-                      Last 30 Days
-                    </button>
-                  </div>
-                </div>
+
+                {pickedDate && (
+                  <button
+                    onClick={() => {
+                      setPickedDate('');
+                      setVisibleCount(PAGE_SIZE);
+                    }}
+                    className="px-5 py-3 rounded-2xl bg-indigo-500/20 border border-indigo-400/60 text-indigo-100 text-sm font-medium hover:bg-indigo-500/30 transition-all"
+                  >
+                    Back to latest {PAGE_SIZE} days
+                  </button>
+                )}
               </div>
+              <p className="text-xs text-white/50 mt-3">
+                Only the dates shown below are loaded, which keeps the page fast.
+              </p>
             </div>
 
             {/* Attendance Grid */}
             <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl sm:rounded-3xl overflow-hidden shadow-2xl">
-              <div className="p-4 sm:p-6 border-b border-white/10">
+              <div className="p-4 sm:p-6 border-b border-white/10 flex items-center justify-between gap-3">
                 <h3 className="text-lg sm:text-xl font-bold text-white">Attendance Records</h3>
+                {loadingDates && (
+                  <div className="w-5 h-5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
+                )}
               </div>
 
+              {loadError && (
+                <div className="mx-4 sm:mx-6 mt-4 rounded-2xl bg-red-500/10 border border-red-500/40 px-4 py-3 text-sm text-red-100">
+                  {loadError}
+                </div>
+              )}
+
               <div className="overflow-x-auto">
-                {filteredAttendance.length === 0 ? (
+                {allDates.length === 0 ? (
                   <div className="p-8 sm:p-12 text-center">
                     <svg
                       className="w-12 h-12 sm:w-16 sm:h-16 text-white/30 mx-auto mb-4"
@@ -568,9 +554,15 @@ export default function StudentAttendancePage() {
                         d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"
                       />
                     </svg>
-                    <p className="text-white/60 text-base sm:text-lg">No attendance records found</p>
+                    <p className="text-white/60 text-base sm:text-lg">No sessions yet</p>
                     <p className="text-white/40 text-xs sm:text-sm mt-2">
-                      Try adjusting your filters or check back later
+                      Check back after the first session is created
+                    </p>
+                  </div>
+                ) : dateWiseAttendance.length === 0 ? (
+                  <div className="p-8 sm:p-12 text-center">
+                    <p className="text-white/60 text-base sm:text-lg">
+                      {loadingDates ? 'Loading attendance...' : 'No attendance to show'}
                     </p>
                   </div>
                 ) : (
@@ -597,8 +589,8 @@ export default function StudentAttendancePage() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5">
-                      {filteredAttendance.map((dateAtt, idx) => (
-                        <tr key={idx} className="hover:bg-white/5 transition-colors">
+                      {dateWiseAttendance.map((dateAtt) => (
+                        <tr key={dateAtt.date} className="hover:bg-white/5 transition-colors">
                           <td className="px-3 sm:px-6 py-3 sm:py-4 font-medium text-white sticky left-0 bg-[#000000]/90 backdrop-blur-xl z-10">
                             <div className="text-xs sm:text-sm">
                               {formatDate(dateAtt.date)}
@@ -607,8 +599,8 @@ export default function StudentAttendancePage() {
                           <td className="px-3 sm:px-6 py-3 sm:py-4 text-xs sm:text-sm text-white/70">
                             {getDayName(dateAtt.date)}
                           </td>
-                          {dateAtt.sessions.map((session, sessionIdx) => (
-                            <td key={sessionIdx} className="px-2 sm:px-6 py-3 sm:py-4 text-center">
+                          {dateAtt.sessions.map((session) => (
+                            <td key={session.sessionNumber} className="px-2 sm:px-6 py-3 sm:py-4 text-center">
                               {session.present === null ? (
                                 // Session didn't exist on this date
                                 <span className="inline-flex items-center justify-center w-8 h-8 sm:w-10 sm:h-10 text-white/40 text-xl sm:text-2xl font-light">
@@ -633,6 +625,19 @@ export default function StudentAttendancePage() {
                   </table>
                 )}
               </div>
+
+              {/* Load older days */}
+              {hasOlderDates && (
+                <div className="p-4 sm:p-6 border-t border-white/10 text-center">
+                  <button
+                    onClick={() => setVisibleCount((c) => c + PAGE_SIZE)}
+                    disabled={loadingDates}
+                    className="px-6 py-3 rounded-2xl bg-white/5 hover:bg-white/10 border border-white/20 text-white text-sm font-medium transition-all disabled:opacity-50"
+                  >
+                    Load older days
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </main>
