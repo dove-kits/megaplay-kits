@@ -1,4 +1,4 @@
-// lib/services/facultyService.ts
+//// lib/services/facultyService.ts
 import {
   collection,
   doc,
