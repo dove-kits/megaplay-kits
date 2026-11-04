@@ -1,18 +1,19 @@
 // lib/services/studentService.ts
-import { 
-  doc, 
-  setDoc, 
-  getDoc, 
-  serverTimestamp, 
-  collection, 
-  query, 
-  where, 
+import {
+  doc,
+  setDoc,
+  getDoc,
+  serverTimestamp,
+  collection,
+  query,
+  where,
   getDocs,
   deleteDoc,
-  Timestamp 
+  writeBatch,
+  Timestamp,
 } from 'firebase/firestore';
 import { db } from '../firebase/config';
-import { getYearCollectionName } from './settingsService';
+import { getAppSettings, getYearCollectionName } from './settingsService';
 
 export interface Student {
   regno: string;
@@ -44,14 +45,25 @@ export interface ColumnMapping {
   email?: string;
 }
 
+type Progress = { current: number; total: number; percent: number };
+type BulkResult = { success: number; failed: number; errors: string[] };
+
+// Firestore allows 500 operations per batch; stay safely below.
+const BATCH_LIMIT = 450;
+
+const getCurrentYear = async (): Promise<string | null> => {
+  const settings = await getAppSettings(); // cached, usually 0 reads
+  return settings?.currentYear || null;
+};
+
 /**
  * Parse CSV helper function
  */
 export const parseCSV = (text: string): { headers: string[]; rows: any[] } => {
-  const lines = text.split('\n').filter(line => line.trim());
-  const headers = lines[0].split(',').map(h => h.trim());
-  const rows = lines.slice(1).map(line => {
-    const values = line.split(',').map(v => v.trim());
+  const lines = text.split('\n').filter((line) => line.trim());
+  const headers = lines[0].split(',').map((h) => h.trim());
+  const rows = lines.slice(1).map((line) => {
+    const values = line.split(',').map((v) => v.trim());
     const row: any = {};
     headers.forEach((header, index) => {
       row[header] = values[index] || '';
@@ -63,7 +75,6 @@ export const parseCSV = (text: string): { headers: string[]; rows: any[] } => {
 
 /**
  * Register a new student for a committee (normal registration flow)
- * Works with both predefined and dynamically added committees
  */
 export const registerStudent = async (
   year: string,
@@ -79,15 +90,15 @@ export const registerStudent = async (
     const colName = getYearCollectionName('students', year);
     const regnoUpper = studentData.regno.trim().toUpperCase();
     const emailLower = studentData.email.trim().toLowerCase();
-    
-    // Use regno as document ID for easy lookups
+
     const ref = doc(db, colName, regnoUpper);
 
-    // Check if student already registered
     const existing = await getDoc(ref);
     if (existing.exists()) {
       return { success: false, error: 'Student already registered for this year' };
     }
+
+    const isReviewed = studentData.status === 'approved' || studentData.status === 'rejected';
 
     const student: Student = {
       ...studentData,
@@ -101,20 +112,14 @@ export const registerStudent = async (
       committee: studentData.committee?.trim(),
       category: studentData.category,
       year,
-      status: studentData.status || 'pending', // Use provided status or default to 'pending'
+      status: studentData.status || 'pending',
       appliedAt: serverTimestamp(),
-      reviewedBy: studentData.status === 'approved' || studentData.status === 'rejected' 
-        ? studentData.email // Set reviewedBy if status is already set (for superadmin)
-        : null,
-      reviewedAt: studentData.status === 'approved' || studentData.status === 'rejected'
-        ? serverTimestamp() // Set reviewedAt if status is already set
-        : null,
+      reviewedBy: isReviewed ? studentData.email : null,
+      reviewedAt: isReviewed ? serverTimestamp() : null,
       rejectionReason: '',
     };
 
     await setDoc(ref, student);
-    console.log('✅ Student registered:', student.regno, 'for committee:', student.committee, 'with status:', student.status);
-    
     return { success: true };
   } catch (error) {
     console.error('❌ Error registering student:', error);
@@ -122,57 +127,67 @@ export const registerStudent = async (
   }
 };
 
+/**
+ * Build the Firestore document for a student added by an admin.
+ */
+const normalizeStudent = (
+  input: Student,
+  year: string,
+  adminUid: string,
+  existingAppliedAt: any
+): Student => ({
+  regno: input.regno.trim().toUpperCase(),
+  name: input.name.trim(),
+  email: input.email?.trim().toLowerCase() || '',
+  phone: input.phone?.trim() || '',
+  department: input.department?.trim() || '',
+  hostel: input.hostel?.trim() || '',
+  roomNumber: input.roomNumber?.trim() || '',
+  committee: input.committee?.trim() || '',
+  category: input.category || 'normal',
+  categories: input.categories || {},
+  year,
+  status: input.status || 'approved', // superadmin entries default to approved
+  appliedAt: existingAppliedAt ?? serverTimestamp(),
+  reviewedBy: adminUid,
+  reviewedAt: serverTimestamp(),
+  rejectionReason: '',
+});
 
 /**
- * Add or update student (for superadmin - bypasses registration checks)
- * Used for bulk uploads and direct admin additions
+ * Add or update ONE student (superadmin).
+ * Pass `yearOverride` if the caller already knows the year.
+ *
+ * FIX: previously read doc 'settings/appSettings' (wrong path) on every call.
+ * Now uses the cached getAppSettings().
  */
 export const addOrUpdateStudent = async (
   studentData: Student,
-  adminUid: string
+  adminUid: string,
+  yearOverride?: string
 ): Promise<{ success: boolean; error?: string }> => {
   try {
     if (!studentData.regno || !studentData.name) {
       return { success: false, error: 'Registration Number and Name are required' };
     }
 
-    // Get current year from settings
-    const settingsRef = doc(db, 'settings', 'appSettings');
-    const settingsSnap = await getDoc(settingsRef);
-    const currentYear = settingsSnap.data()?.currentYear;
-
+    const currentYear = yearOverride || (await getCurrentYear());
     if (!currentYear) {
       return { success: false, error: 'No active year configured' };
     }
 
     const colName = getYearCollectionName('students', currentYear);
-    const regnoUpper = studentData.regno.trim().toUpperCase();
-    const ref = doc(db, colName, regnoUpper);
+    const ref = doc(db, colName, studentData.regno.trim().toUpperCase());
 
-    // Check if student exists
     const existing = await getDoc(ref);
-
-    const student: Student = {
-      regno: regnoUpper,
-      name: studentData.name.trim(),
-      email: studentData.email?.trim().toLowerCase() || '',
-      phone: studentData.phone?.trim() || '',
-      department: studentData.department?.trim() || '',
-      hostel: studentData.hostel?.trim() || '',
-      roomNumber: studentData.roomNumber?.trim() || '',
-      committee: studentData.committee?.trim() || '',
-      category: studentData.category || 'normal',
-      categories: studentData.categories || {},
-      year: currentYear,
-      status: studentData.status || 'approved', // Default to approved for superadmin entries
-      appliedAt: existing.exists() ? existing.data()?.appliedAt : serverTimestamp(),
-      reviewedBy: adminUid,
-      reviewedAt: serverTimestamp(),
-      rejectionReason: '',
-    };
+    const student = normalizeStudent(
+      studentData,
+      currentYear,
+      adminUid,
+      existing.exists() ? existing.data()?.appliedAt : undefined
+    );
 
     await setDoc(ref, student, { merge: true });
-    console.log(`✅ Student ${regnoUpper} ${existing.exists() ? 'updated' : 'added'} successfully`);
     return { success: true };
   } catch (error) {
     console.error('❌ Error adding/updating student:', error);
@@ -181,125 +196,107 @@ export const addOrUpdateStudent = async (
 };
 
 /**
- * Bulk upload students (sequential)
- * Processes uploads one at a time for better error tracking
+ * Bulk upload (shared implementation).
+ *
+ * Before: per row = 1 settings read + 1 student read + 1 write, sequential.
+ * Now:    settings read once (cached), ONE collection read to preserve
+ *         `appliedAt` of existing students (a fresh year has ~0 docs),
+ *         then writes in batches of up to 450.
  */
-export const bulkUploadStudents = async (
+const runBulkUpload = async (
   rows: any[],
   mapping: ColumnMapping,
   categoryType: 'od' | 'scholarship',
   adminUid: string,
-  onProgress?: (progress: { current: number; total: number; percent: number }) => void
-): Promise<{ success: number; failed: number; errors: string[] }> => {
+  onProgress?: (progress: Progress) => void
+): Promise<BulkResult> => {
   const total = rows.length;
+  const errors: string[] = [];
   let success = 0;
   let failed = 0;
-  const errors: string[] = [];
 
-  for (let i = 0; i < rows.length; i++) {
-    try {
-      const row = rows[i];
-      const studentData: Student = {
-        regno: row[mapping.regNo] || '',
-        name: row[mapping.name] || '',
-        committee: mapping.committee ? row[mapping.committee] : '',
-        hostel: mapping.hostel ? row[mapping.hostel] : '',
-        roomNumber: mapping.roomNumber ? row[mapping.roomNumber] : '',
-        phone: mapping.phoneNumber ? row[mapping.phoneNumber] : '',
-        department: mapping.department ? row[mapping.department] : '',
-        email: mapping.email ? row[mapping.email] : '',
-        category: categoryType === 'od' ? 'normal' : 'scholarship',
-        categories: { [categoryType]: true },
-      };
-
-      const result = await addOrUpdateStudent(studentData, adminUid);
-      if (result.success) {
-        success++;
-      } else {
-        failed++;
-        errors.push(`${studentData.regno}: ${result.error}`);
-      }
-    } catch (error: any) {
-      failed++;
-      errors.push(`Row ${i + 1}: ${error.message}`);
-    }
-
-    // Report progress
+  const report = (current: number) => {
     if (onProgress) {
-      const current = i + 1;
-      const percent = Math.round((current / total) * 100);
-      onProgress({ current, total, percent });
+      onProgress({
+        current,
+        total,
+        percent: total === 0 ? 100 : Math.round((current / total) * 100),
+      });
     }
+  };
+
+  const year = await getCurrentYear();
+  if (!year) {
+    return { success: 0, failed: total, errors: ['No active year configured'] };
+  }
+
+  const colName = getYearCollectionName('students', year);
+
+  // One read of the collection instead of one read per row.
+  const existingApplied = new Map<string, any>();
+  const existingSnap = await getDocs(collection(db, colName));
+  existingSnap.forEach((d) => existingApplied.set(d.id, d.data()?.appliedAt ?? null));
+
+  // Validate + prepare
+  const prepared: { regno: string; data: Student }[] = [];
+  rows.forEach((row, i) => {
+    const input: Student = {
+      regno: row[mapping.regNo] || '',
+      name: row[mapping.name] || '',
+      committee: mapping.committee ? row[mapping.committee] : '',
+      hostel: mapping.hostel ? row[mapping.hostel] : '',
+      roomNumber: mapping.roomNumber ? row[mapping.roomNumber] : '',
+      phone: mapping.phoneNumber ? row[mapping.phoneNumber] : '',
+      department: mapping.department ? row[mapping.department] : '',
+      email: mapping.email ? row[mapping.email] : '',
+      category: categoryType === 'od' ? 'normal' : 'scholarship',
+      categories: { [categoryType]: true },
+    };
+
+    if (!input.regno.trim() || !input.name.trim()) {
+      failed++;
+      errors.push(`Row ${i + 1}: Registration Number and Name are required`);
+      return;
+    }
+
+    const regno = input.regno.trim().toUpperCase();
+    prepared.push({
+      regno,
+      data: normalizeStudent(input, year, adminUid, existingApplied.get(regno)),
+    });
+  });
+
+  let processed = failed;
+  report(processed);
+
+  for (let i = 0; i < prepared.length; i += BATCH_LIMIT) {
+    const chunk = prepared.slice(i, i + BATCH_LIMIT);
+    try {
+      const batch = writeBatch(db);
+      chunk.forEach(({ regno, data }) => {
+        batch.set(doc(db, colName, regno), data, { merge: true });
+      });
+      await batch.commit();
+      success += chunk.length;
+    } catch (error: any) {
+      failed += chunk.length;
+      errors.push(`Rows in batch ${Math.floor(i / BATCH_LIMIT) + 1}: ${error?.message || 'Batch failed'}`);
+    }
+    processed += chunk.length;
+    report(processed);
   }
 
   return { success, failed, errors };
 };
 
-/**
- * Bulk upload students (parallel)
- * Processes all uploads concurrently for faster performance
- */
-export const bulkUploadStudentsParallel = async (
-  rows: any[],
-  mapping: ColumnMapping,
-  categoryType: 'od' | 'scholarship',
-  adminUid: string,
-  onProgress?: (progress: { current: number; total: number; percent: number }) => void
-): Promise<{ success: number; failed: number; errors: string[] }> => {
-  const total = rows.length;
-  let completed = 0;
-  const errors: string[] = [];
+/** Bulk upload students (kept for backwards compatibility). */
+export const bulkUploadStudents = runBulkUpload;
 
-  const uploadPromises = rows.map(async (row, index) => {
-    try {
-      const studentData: Student = {
-        regno: row[mapping.regNo] || '',
-        name: row[mapping.name] || '',
-        committee: mapping.committee ? row[mapping.committee] : '',
-        hostel: mapping.hostel ? row[mapping.hostel] : '',
-        roomNumber: mapping.roomNumber ? row[mapping.roomNumber] : '',
-        phone: mapping.phoneNumber ? row[mapping.phoneNumber] : '',
-        department: mapping.department ? row[mapping.department] : '',
-        email: mapping.email ? row[mapping.email] : '',
-        category: categoryType === 'od' ? 'normal' : 'scholarship',
-        categories: { [categoryType]: true },
-      };
-
-      const result = await addOrUpdateStudent(studentData, adminUid);
-      
-      completed++;
-      if (onProgress) {
-        const percent = Math.round((completed / total) * 100);
-        onProgress({ current: completed, total, percent });
-      }
-
-      return { success: result.success, error: result.error, regno: studentData.regno };
-    } catch (error: any) {
-      completed++;
-      if (onProgress) {
-        const percent = Math.round((completed / total) * 100);
-        onProgress({ current: completed, total, percent });
-      }
-      return { success: false, error: error.message, regno: `Row ${index + 1}` };
-    }
-  });
-
-  const results = await Promise.all(uploadPromises);
-  
-  const success = results.filter(r => r.success).length;
-  const failed = results.filter(r => !r.success).length;
-  
-  results.forEach(r => {
-    if (!r.success && r.error) {
-      errors.push(`${r.regno}: ${r.error}`);
-    }
-  });
-
-  return { success, failed, errors };
-};
+/** Parallel version is no longer needed: batching is already fast. */
+export const bulkUploadStudentsParallel = runBulkUpload;
 
 /**
- * Get student by registration number
+ * Get student by registration number (1 read)
  */
 export const getStudentByRegno = async (
   year: string,
@@ -312,13 +309,8 @@ export const getStudentByRegno = async (
     }
 
     const colName = getYearCollectionName('students', year);
-    const ref = doc(db, colName, regno.toUpperCase());
-    const snap = await getDoc(ref);
-
-    if (snap.exists()) {
-      return snap.data() as Student;
-    }
-    return null;
+    const snap = await getDoc(doc(db, colName, regno.toUpperCase()));
+    return snap.exists() ? (snap.data() as Student) : null;
   } catch (error) {
     console.error('Error getting student by regno:', error);
     return null;
@@ -327,7 +319,6 @@ export const getStudentByRegno = async (
 
 /**
  * Get student by email address
- * Used to check if a user has already registered
  */
 export const getStudentByEmail = async (
   year: string,
@@ -340,14 +331,10 @@ export const getStudentByEmail = async (
     }
 
     const colName = getYearCollectionName('students', year);
-    const studentsRef = collection(db, colName);
-    const q = query(studentsRef, where('email', '==', email.toLowerCase()));
+    const q = query(collection(db, colName), where('email', '==', email.toLowerCase()));
     const snap = await getDocs(q);
 
-    if (!snap.empty) {
-      return snap.docs[0].data() as Student;
-    }
-    return null;
+    return snap.empty ? null : (snap.docs[0].data() as Student);
   } catch (error) {
     console.error('Error getting student by email:', error);
     return null;
@@ -356,7 +343,6 @@ export const getStudentByEmail = async (
 
 /**
  * Get all students for a specific committee
- * Works with both predefined and dynamic committees
  */
 export const getStudentsByCommittee = async (
   year: string,
@@ -371,27 +357,13 @@ export const getStudentsByCommittee = async (
 
     const colName = getYearCollectionName('students', year);
     const studentsRef = collection(db, colName);
-    
-    // Build query based on parameters
-    let q;
-    if (status) {
-      q = query(
-        studentsRef, 
-        where('committee', '==', committeeKey),
-        where('status', '==', status)
-      );
-    } else {
-      q = query(studentsRef, where('committee', '==', committeeKey));
-    }
-    
-    const snapshot = await getDocs(q);
-    
-    const students: Student[] = [];
-    snapshot.forEach((doc) => {
-      students.push(doc.data() as Student);
-    });
 
-    return students;
+    const q = status
+      ? query(studentsRef, where('committee', '==', committeeKey), where('status', '==', status))
+      : query(studentsRef, where('committee', '==', committeeKey));
+
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map((d) => d.data() as Student);
   } catch (error) {
     console.error('Error getting students by committee:', error);
     return [];
@@ -409,13 +381,12 @@ export const getPendingCountByCommittee = async (
     if (!year || !committeeKey) return 0;
 
     const colName = getYearCollectionName('students', year);
-    const studentsRef = collection(db, colName);
     const q = query(
-      studentsRef,
+      collection(db, colName),
       where('committee', '==', committeeKey),
       where('status', '==', 'pending')
     );
-    
+
     const snapshot = await getDocs(q);
     return snapshot.size;
   } catch (error) {
@@ -441,7 +412,7 @@ export const updateStudentStatus = async (
 
     const colName = getYearCollectionName('students', year);
     const ref = doc(db, colName, regno.toUpperCase());
-    
+
     const updateData: any = {
       status,
       reviewedBy,
@@ -453,8 +424,6 @@ export const updateStudentStatus = async (
     }
 
     await setDoc(ref, updateData, { merge: true });
-    
-    console.log(`✅ Student ${regno} ${status} by ${reviewedBy}`);
     return { success: true };
   } catch (error) {
     console.error('Error updating student status:', error);
@@ -463,7 +432,8 @@ export const updateStudentStatus = async (
 };
 
 /**
- * Get all students for a year (admin function)
+ * Get all students for a year (ADMIN ONLY: costs 1 read per student).
+ * Never call this from student-facing pages.
  */
 export const getAllStudents = async (year: string): Promise<Student[]> => {
   try {
@@ -473,15 +443,8 @@ export const getAllStudents = async (year: string): Promise<Student[]> => {
     }
 
     const colName = getYearCollectionName('students', year);
-    const studentsRef = collection(db, colName);
-    const snapshot = await getDocs(studentsRef);
-    
-    const students: Student[] = [];
-    snapshot.forEach((doc) => {
-      students.push(doc.data() as Student);
-    });
-
-    return students;
+    const snapshot = await getDocs(collection(db, colName));
+    return snapshot.docs.map((d) => d.data() as Student);
   } catch (error) {
     console.error('Error getting all students:', error);
     return [];
@@ -501,12 +464,7 @@ export const deleteStudent = async (
     }
 
     const colName = getYearCollectionName('students', year);
-    const ref = doc(db, colName, regno.toUpperCase());
-    
-    // Actually delete the document
-    await deleteDoc(ref);
-    
-    console.log(`✅ Student ${regno} deleted successfully`);
+    await deleteDoc(doc(db, colName, regno.toUpperCase()));
     return { success: true };
   } catch (error) {
     console.error('Error deleting student:', error);
@@ -515,37 +473,39 @@ export const deleteStudent = async (
 };
 
 /**
- * Bulk delete students with progress tracking
+ * Bulk delete students in batches (much faster than one-by-one)
  */
 export const bulkDeleteStudents = async (
   year: string,
   regnos: string[],
-  onProgress?: (progress: { current: number; total: number; percent: number }) => void
-): Promise<{ success: number; failed: number; errors: string[] }> => {
+  onProgress?: (progress: Progress) => void
+): Promise<BulkResult> => {
   const total = regnos.length;
   let success = 0;
   let failed = 0;
   const errors: string[] = [];
 
-  for (let i = 0; i < regnos.length; i++) {
+  if (!year) {
+    return { success: 0, failed: total, errors: ['Missing year'] };
+  }
+
+  const colName = getYearCollectionName('students', year);
+
+  for (let i = 0; i < regnos.length; i += BATCH_LIMIT) {
+    const chunk = regnos.slice(i, i + BATCH_LIMIT);
     try {
-      const result = await deleteStudent(year, regnos[i]);
-      if (result.success) {
-        success++;
-      } else {
-        failed++;
-        errors.push(`${regnos[i]}: ${result.error}`);
-      }
+      const batch = writeBatch(db);
+      chunk.forEach((regno) => batch.delete(doc(db, colName, regno.toUpperCase())));
+      await batch.commit();
+      success += chunk.length;
     } catch (error: any) {
-      failed++;
-      errors.push(`${regnos[i]}: ${error.message}`);
+      failed += chunk.length;
+      errors.push(`${chunk[0]}…${chunk[chunk.length - 1]}: ${error?.message || 'Batch failed'}`);
     }
 
-    // Report progress
     if (onProgress) {
-      const current = i + 1;
-      const percent = Math.round((current / total) * 100);
-      onProgress({ current, total, percent });
+      const current = Math.min(i + chunk.length, total);
+      onProgress({ current, total, percent: Math.round((current / total) * 100) });
     }
   }
 
