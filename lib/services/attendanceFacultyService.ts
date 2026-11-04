@@ -7,11 +7,10 @@ import {
   getDocs,
   deleteDoc,
   serverTimestamp,
-  query,
-  where,
 } from 'firebase/firestore';
 import { db } from '../firebase/config';
 import { getYearCollectionName } from './settingsService';
+import { TTLCache } from '../utils/ttlCache';
 
 export interface AttendanceFaculty {
   email: string;
@@ -22,21 +21,30 @@ export interface AttendanceFaculty {
   year: string;
 }
 
-// Check if user is attendance faculty
+const COLLECTION = 'attendance_faculty';
+const NON_DATA_DOC_IDS = new Set(['metadata', '_init']);
+
+// Cached briefly (3 min). UX optimisation only: enforce real access control
+// with Firestore security rules.
+const roleCache = new TTLCache<boolean>(3 * 60 * 1000);
+const cacheKey = (year: string, email: string) => `${year}:${email.toLowerCase()}`;
+
+// Check if user is attendance faculty (1 read, then cached)
 export const isAttendanceFaculty = async (
   email: string,
   year: string
 ): Promise<boolean> => {
-  try {
-    const colName = getYearCollectionName('attendance_faculty', year);
-    const ref = doc(db, colName, email.toLowerCase());
-    const snap = await getDoc(ref);
+  const key = cacheKey(year, email);
+  const cached = roleCache.get(key);
+  if (cached !== undefined) return cached;
 
-    if (snap.exists()) {
-      const data = snap.data();
-      return data.isActive === true;
-    }
-    return false;
+  try {
+    const colName = getYearCollectionName(COLLECTION, year);
+    const snap = await getDoc(doc(db, colName, email.toLowerCase()));
+    const result = snap.exists() && snap.data().isActive === true;
+
+    roleCache.set(key, result); // only cache successful lookups
+    return result;
   } catch (error) {
     console.error('Error checking attendance faculty:', error);
     return false;
@@ -48,12 +56,12 @@ export const getAttendanceFacultyByYear = async (
   year: string
 ): Promise<AttendanceFaculty[]> => {
   try {
-    const colName = getYearCollectionName('attendance_faculty', year);
+    const colName = getYearCollectionName(COLLECTION, year);
     const snap = await getDocs(collection(db, colName));
 
     const result: AttendanceFaculty[] = [];
     snap.forEach((d) => {
-      if (d.id === 'metadata') return;
+      if (NON_DATA_DOC_IDS.has(d.id)) return;
       result.push(d.data() as AttendanceFaculty);
     });
 
@@ -70,7 +78,7 @@ export const assignAttendanceFaculty = async (
   email: string,
   assignedBy: string
 ): Promise<void> => {
-  const colName = getYearCollectionName('attendance_faculty', year);
+  const colName = getYearCollectionName(COLLECTION, year);
   const ref = doc(db, colName, email.toLowerCase());
 
   const data: AttendanceFaculty = {
@@ -83,7 +91,7 @@ export const assignAttendanceFaculty = async (
   };
 
   await setDoc(ref, data);
-  console.log('✅ Attendance faculty assigned:', email);
+  roleCache.delete(cacheKey(year, email));
 };
 
 // Remove attendance faculty
@@ -91,8 +99,7 @@ export const removeAttendanceFaculty = async (
   year: string,
   email: string
 ): Promise<void> => {
-  const colName = getYearCollectionName('attendance_faculty', year);
-  const ref = doc(db, colName, email.toLowerCase());
-  await deleteDoc(ref);
-  console.log('✅ Attendance faculty removed:', email);
+  const colName = getYearCollectionName(COLLECTION, year);
+  await deleteDoc(doc(db, colName, email.toLowerCase()));
+  roleCache.delete(cacheKey(year, email));
 };
