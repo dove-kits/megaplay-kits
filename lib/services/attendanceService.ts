@@ -2,16 +2,16 @@
 import {
   collection,
   doc,
-  setDoc,
   getDocs,
   query,
   where,
   serverTimestamp,
-  orderBy,
   getDoc,
   addDoc,
   deleteDoc,
   Timestamp,
+  QueryDocumentSnapshot,
+  DocumentData,
 } from 'firebase/firestore';
 
 import { db } from '../firebase/config';
@@ -50,29 +50,61 @@ export interface StudentValidationResult {
   error?: string;
 }
 
-// Validate student (check if approved)
+// ---------- helpers ----------
+
+const mapAttendanceDoc = (d: QueryDocumentSnapshot<DocumentData>): AttendanceRecord => {
+  const data = d.data();
+  return {
+    attendanceId: d.id,
+    sessionId: data.sessionId || '',
+    sessionName: data.sessionName || '',
+    date: data.date || '',
+    sessionNumber: data.sessionNumber || 0,
+    regno: data.regno || '',
+    studentName: data.studentName || '',
+    studentEmail: data.email || '',
+    email: data.email || '',
+    department: data.department || '',
+    hostel: data.hostel || '',
+    roomNumber: data.roomNumber || '',
+    registeredCommittee: data.registeredCommittee || '',
+    registeredCategory: data.registeredCategory || 'normal',
+    markedCategory: data.markedCategory || 'od',
+    markedBy: data.markedBy || '',
+    markedAt: data.markedAt || null,
+  };
+};
+
+const toMillis = (ts: any): number => {
+  if (!ts) return 0;
+  if (typeof ts.toMillis === 'function') return ts.toMillis();
+  if (typeof ts.toDate === 'function') return ts.toDate().getTime();
+  return 0;
+};
+
+// ---------- API ----------
+
+/**
+ * Validate student (must exist and be approved) - 1 read.
+ * FIX: previously used the wrong path `students_${year}`; the app stores
+ * students at years/{year}/students.
+ */
 export const validateStudent = async (
   regno: string,
   year: string
 ): Promise<StudentValidationResult> => {
   try {
-    const studentRef = doc(db, `students_${year}`, regno.toUpperCase());
-    const studentSnap = await getDoc(studentRef);
+    const studentsCol = getYearCollectionName('students', year);
+    const studentSnap = await getDoc(doc(db, studentsCol, regno.toUpperCase()));
 
     if (!studentSnap.exists()) {
-      return {
-        valid: false,
-        error: 'Student not found in database',
-      };
+      return { valid: false, error: 'Student not found in database' };
     }
 
     const student = studentSnap.data();
 
     if (student.status !== 'approved') {
-      return {
-        valid: false,
-        error: 'Student not approved yet',
-      };
+      return { valid: false, error: 'Student not approved yet' };
     }
 
     return {
@@ -87,14 +119,13 @@ export const validateStudent = async (
     };
   } catch (error) {
     console.error('Error validating student:', error);
-    return {
-      valid: false,
-      error: 'Error validating student',
-    };
+    return { valid: false, error: 'Error validating student' };
   }
 };
 
-// Check if student already marked in session
+/**
+ * Check if student already marked in session
+ */
 export const checkDuplicateAttendance = async (
   year: string,
   sessionId: string,
@@ -108,7 +139,6 @@ export const checkDuplicateAttendance = async (
       where('regno', '==', regno.toUpperCase())
     );
     const snap = await getDocs(q);
-
     return !snap.empty;
   } catch (error) {
     console.error('Error checking duplicate:', error);
@@ -116,7 +146,9 @@ export const checkDuplicateAttendance = async (
   }
 };
 
-// Mark attendance
+/**
+ * Mark attendance. Cost: 2 reads (duplicate check + student) and 1 write.
+ */
 export async function markAttendance(
   year: string,
   sessionId: string,
@@ -132,32 +164,25 @@ export async function markAttendance(
   error?: string;
 }> {
   try {
-    // Validate date parameter
     if (!sessionDate || sessionDate.trim() === '') {
-      console.error('⚠️ sessionDate is empty or undefined');
-      return {
-        success: false,
-        error: 'Session date is required',
-      };
+      return { success: false, error: 'Session date is required' };
     }
 
-    console.log('📅 Marking attendance with date:', sessionDate);
-
-    // 1. Check if student already marked in THIS session (any category)
+    const regnoUpper = regno.toUpperCase();
     const attendanceCol = getYearCollectionName('attendance', year);
-    const q = query(
-      collection(db, attendanceCol),
-      where('sessionId', '==', sessionId),
-      where('regno', '==', regno.toUpperCase())
+
+    // 1. Already marked in THIS session (any category)?
+    const existingSnap = await getDocs(
+      query(
+        collection(db, attendanceCol),
+        where('sessionId', '==', sessionId),
+        where('regno', '==', regnoUpper)
+      )
     );
 
-    const existingSnap = await getDocs(q);
-
     if (!existingSnap.empty) {
-      const existingRecord = existingSnap.docs[0].data() as AttendanceRecord;
-      const existingCategory = existingRecord.markedCategory;
+      const existingCategory = (existingSnap.docs[0].data() as AttendanceRecord).markedCategory;
 
-      // If trying to mark in same category, show already marked
       if (existingCategory === markedCategory) {
         return {
           success: false,
@@ -165,41 +190,33 @@ export async function markAttendance(
         };
       }
 
-      // If different category, show conflict error
       return {
         success: false,
         error: `Student already marked in ${existingCategory.toUpperCase()} for this session. Cannot mark in ${markedCategory.toUpperCase()}. Delete the existing entry first.`,
       };
     }
 
-    // 2. Get student details from students collection
+    // 2. Student must exist and be approved
     const studentsCol = getYearCollectionName('students', year);
-    const studentRef = doc(db, studentsCol, regno.toUpperCase());
-    const studentSnap = await getDoc(studentRef);
+    const studentSnap = await getDoc(doc(db, studentsCol, regnoUpper));
 
     if (!studentSnap.exists()) {
-      return {
-        success: false,
-        error: 'Student not found in database',
-      };
+      return { success: false, error: 'Student not found in database' };
     }
 
     const student = studentSnap.data();
 
     if (student.status !== 'approved') {
-      return {
-        success: false,
-        error: 'Student registration is not approved',
-      };
+      return { success: false, error: 'Student registration is not approved' };
     }
 
-    // 3. Mark attendance with proper field mapping
+    // 3. Save
     const attendanceData = {
       sessionId,
       sessionName,
       date: sessionDate,
       sessionNumber,
-      regno: regno.toUpperCase(),
+      regno: regnoUpper,
       studentName: student.name,
       email: student.email,
       department: student.department || '',
@@ -212,11 +229,7 @@ export async function markAttendance(
       markedAt: serverTimestamp(),
     };
 
-    console.log('💾 Saving attendance data:', attendanceData);
-
     const docRef = await addDoc(collection(db, attendanceCol), attendanceData);
-
-    console.log('✅ Attendance saved with ID:', docRef.id);
 
     return {
       success: true,
@@ -228,58 +241,27 @@ export async function markAttendance(
     };
   } catch (error) {
     console.error('❌ Error marking attendance:', error);
-    return {
-      success: false,
-      error: 'Failed to mark attendance',
-    };
+    return { success: false, error: 'Failed to mark attendance' };
   }
 }
 
-// Get attendance for a session
+/**
+ * Get attendance for a session (1 read per record in that session)
+ */
 export const getSessionAttendance = async (
   year: string,
   sessionId: string
 ): Promise<AttendanceRecord[]> => {
   try {
     const colName = getYearCollectionName('attendance', year);
-    const q = query(collection(db, colName), where('sessionId', '==', sessionId));
-    const snap = await getDocs(q);
+    const snap = await getDocs(
+      query(collection(db, colName), where('sessionId', '==', sessionId))
+    );
 
-    const records: AttendanceRecord[] = [];
-    snap.forEach((d) => {
-      const data = d.data();
-      records.push({
-        attendanceId: d.id,
-        sessionId: data.sessionId || '',
-        sessionName: data.sessionName || '',
-        date: data.date || '',
-        sessionNumber: data.sessionNumber || 0,
-        regno: data.regno || '',
-        studentName: data.studentName || '',
-        studentEmail: data.email || '',
-        email: data.email || '',
-        department: data.department || '',
-        hostel: data.hostel || '',
-        roomNumber: data.roomNumber || '',
-        registeredCommittee: data.registeredCommittee || '',
-        registeredCategory: data.registeredCategory || 'normal',
-        markedCategory: data.markedCategory || 'od',
-        markedBy: data.markedBy || '',
-        markedAt: data.markedAt || null,
-      });
-    });
+    const records = snap.docs.map(mapAttendanceDoc);
 
-    // Sort by marked time (most recent first)
-    records.sort((a, b) => {
-      if (!a.markedAt && !b.markedAt) return 0;
-      if (!a.markedAt) return 1;
-      if (!b.markedAt) return -1;
-
-      const aTime = a.markedAt?.toMillis?.() || a.markedAt?.toDate?.().getTime() || 0;
-      const bTime = b.markedAt?.toMillis?.() || b.markedAt?.toDate?.().getTime() || 0;
-      return bTime - aTime;
-    });
-
+    // Most recently marked first
+    records.sort((a, b) => toMillis(b.markedAt) - toMillis(a.markedAt));
     return records;
   } catch (error) {
     console.error('Error getting session attendance:', error);
@@ -287,7 +269,10 @@ export const getSessionAttendance = async (
   }
 };
 
-// Get student attendance history
+/**
+ * Get ONE student's attendance history (1 read per record of that student).
+ * Use this instead of getAllAttendance() + filter.
+ */
 export const getStudentAttendance = async (
   year: string,
   regno: string,
@@ -296,38 +281,16 @@ export const getStudentAttendance = async (
 ): Promise<AttendanceRecord[]> => {
   try {
     const colName = getYearCollectionName('attendance', year);
-    const q = query(collection(db, colName), where('regno', '==', regno.toUpperCase()));
+    const snap = await getDocs(
+      query(collection(db, colName), where('regno', '==', regno.toUpperCase()))
+    );
 
-    const snap = await getDocs(q);
+    let records = snap.docs.map(mapAttendanceDoc);
 
-    let records: AttendanceRecord[] = [];
-    snap.forEach((d) => {
-      const data = d.data();
-      records.push({
-        attendanceId: d.id,
-        sessionId: data.sessionId || '',
-        sessionName: data.sessionName || '',
-        date: data.date || '',
-        sessionNumber: data.sessionNumber || 0,
-        regno: data.regno || '',
-        studentName: data.studentName || '',
-        registeredCommittee: data.registeredCommittee || '',
-        registeredCategory: data.registeredCategory || 'normal',
-        markedCategory: data.markedCategory || 'od',
-        markedBy: data.markedBy || '',
-        markedAt: data.markedAt || null,
-      });
-    });
+    if (startDate) records = records.filter((r) => r.date && r.date >= startDate);
+    if (endDate) records = records.filter((r) => r.date && r.date <= endDate);
 
-    // Filter by date range if provided
-    if (startDate) {
-      records = records.filter((r) => r.date && r.date >= startDate);
-    }
-    if (endDate) {
-      records = records.filter((r) => r.date && r.date <= endDate);
-    }
-
-    // Sort by date (most recent first)
+    // Most recent date first
     records.sort((a, b) => {
       if (!a.date && !b.date) return 0;
       if (!a.date) return 1;
@@ -342,69 +305,39 @@ export const getStudentAttendance = async (
   }
 };
 
-// Delete attendance record
+/**
+ * Delete attendance record
+ */
 export async function deleteAttendance(year: string, attendanceId: string): Promise<void> {
   if (!attendanceId || attendanceId.trim() === '') {
     throw new Error('Attendance ID is required');
   }
 
   const attendanceCol = getYearCollectionName('attendance', year);
-  const attendanceRef = doc(db, attendanceCol, attendanceId);
-
-  await deleteDoc(attendanceRef);
+  await deleteDoc(doc(db, attendanceCol, attendanceId));
 }
 
-// Get all attendance records for a year
+/**
+ * Get ALL attendance records for a year.
+ * ⚠️ EXPENSIVE: 1 read per record (students × sessions). Use only for
+ * full exports / reports, never for per-student or per-session views.
+ */
 export async function getAllAttendance(year: string): Promise<AttendanceRecord[]> {
   const attendanceCol = getYearCollectionName('attendance', year);
-  const attendanceRef = collection(db, attendanceCol);
+  const snapshot = await getDocs(collection(db, attendanceCol));
 
-  const snapshot = await getDocs(attendanceRef);
+  const records = snapshot.docs.map(mapAttendanceDoc);
 
-  const records: AttendanceRecord[] = snapshot.docs.map((doc) => {
-    const data = doc.data();
-    return {
-      attendanceId: doc.id,
-      sessionId: data.sessionId || '',
-      sessionName: data.sessionName || '',
-      date: data.date || '',
-      sessionNumber: data.sessionNumber || 0,
-      regno: data.regno || '',
-      studentName: data.studentName || '',
-      studentEmail: data.email || '',
-      email: data.email || '',
-      department: data.department || '',
-      hostel: data.hostel || '',
-      roomNumber: data.roomNumber || '',
-      registeredCommittee: data.registeredCommittee || '',
-      registeredCategory: data.registeredCategory || 'normal',
-      markedCategory: data.markedCategory || 'od',
-      markedBy: data.markedBy || '',
-      markedAt: data.markedAt || null,
-    };
-  });
-
-  // Sort by date (newest first), then by markedAt time
+  // Newest date first, then newest marked time
   records.sort((a, b) => {
-    // Handle undefined or empty dates - push them to the end
     if (!a.date && !b.date) return 0;
     if (!a.date) return 1;
     if (!b.date) return -1;
 
-    // Compare dates
     const dateComparison = b.date.localeCompare(a.date);
-    if (dateComparison !== 0) {
-      return dateComparison;
-    }
+    if (dateComparison !== 0) return dateComparison;
 
-    // If dates are equal, sort by markedAt timestamp
-    if (a.markedAt && b.markedAt) {
-      const aTime = a.markedAt.toDate ? a.markedAt.toDate().getTime() : 0;
-      const bTime = b.markedAt.toDate ? b.markedAt.toDate().getTime() : 0;
-      return bTime - aTime;
-    }
-
-    return 0;
+    return toMillis(b.markedAt) - toMillis(a.markedAt);
   });
 
   return records;
