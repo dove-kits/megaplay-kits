@@ -15,7 +15,6 @@ import {
   reactivateSession,
   checkSessionAttendance,
   createSingleSession,
-  getSessionsByDate,
 } from '@/lib/services/sessionService';
 
 export default function ManageSessionsPage() {
@@ -42,7 +41,8 @@ export default function ManageSessionsPage() {
       return;
     }
     loadData();
-  }, [user, authLoading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.uid, authLoading]);
 
   const loadData = async () => {
     try {
@@ -93,6 +93,13 @@ export default function ManageSessionsPage() {
     return acc;
   }, {} as Record<string, Session[]>);
 
+  // Next session number for a date, computed from the sessions already in state
+  const getNextSessionNumber = (date: string) =>
+    Math.max(
+      0,
+      ...sessions.filter((s) => s.date === date).map((s) => s.sessionNumber || 0)
+    ) + 1;
+
   const handleEditStart = (session: Session) => {
     setEditingSession(session.sessionId);
     setEditedName(session.name);
@@ -111,8 +118,11 @@ export default function ManageSessionsPage() {
 
     setProcessingSession(sessionId);
     try {
-      await updateSessionName(currentYear, sessionId, editedName.trim());
-      await loadSessions(currentYear);
+      const trimmed = editedName.trim();
+      await updateSessionName(currentYear, sessionId, trimmed);
+      setSessions((prev) =>
+        prev.map((s) => (s.sessionId === sessionId ? { ...s, name: trimmed } : s))
+      );
       setEditingSession(null);
       setEditedName('');
     } catch (error) {
@@ -158,7 +168,7 @@ export default function ManageSessionsPage() {
       }
 
       await deleteSession(currentYear, session.sessionId, deleteAttendance);
-      await loadSessions(currentYear);
+      setSessions((prev) => prev.filter((s) => s.sessionId !== session.sessionId));
       alert('Session deleted successfully!');
     } catch (error) {
       console.error('Failed to delete session:', error);
@@ -173,12 +183,19 @@ export default function ManageSessionsPage() {
 
     setProcessingSession(session.sessionId);
     try {
+      let nextStatus: Session['status'];
       if (session.status === 'cancelled') {
         await reactivateSession(currentYear, session.sessionId);
+        nextStatus = 'active';
       } else {
         await cancelSession(currentYear, session.sessionId);
+        nextStatus = 'cancelled';
       }
-      await loadSessions(currentYear);
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.sessionId === session.sessionId ? { ...s, status: nextStatus } : s
+        )
+      );
     } catch (error) {
       console.error('Failed to update session status:', error);
       alert('Failed to update session status. Please try again.');
@@ -187,20 +204,9 @@ export default function ManageSessionsPage() {
     }
   };
 
-  const handleAddSessionStart = async (date: string) => {
+  const handleAddSessionStart = (date: string) => {
     setAddingToDate(date);
-    
-    // Get existing sessions to determine next session number
-    if (currentYear) {
-      const existingSessions = await getSessionsByDate(currentYear, date);
-      const maxSessionNumber = existingSessions.length > 0
-        ? Math.max(...existingSessions.map(s => s.sessionNumber || 0))
-        : 0;
-      const nextSessionNumber = maxSessionNumber + 1;
-      setNewSessionName(`New Session ${nextSessionNumber}`);
-    } else {
-      setNewSessionName('New Session 1');
-    }
+    setNewSessionName(`New Session ${getNextSessionNumber(date)}`);
   };
 
   const handleAddSessionCancel = () => {
@@ -215,29 +221,18 @@ export default function ManageSessionsPage() {
 
     setAddingSession(true);
     try {
-      // Get existing sessions for this date to find the highest session number
-      const existingSessions = await getSessionsByDate(currentYear, addingToDate);
-      
-      // Find the highest session number
-      const maxSessionNumber = existingSessions.length > 0
-        ? Math.max(...existingSessions.map(s => s.sessionNumber || 0))
-        : 0;
-      
-      const nextSessionNumber = maxSessionNumber + 1;
-      
-      // Use the session name if provided, otherwise use default
+      const nextSessionNumber = getNextSessionNumber(addingToDate);
       const sessionName = newSessionName.trim() || `New Session ${nextSessionNumber}`;
-      
-      // Create new session with proper session number
-      await createSingleSession(
+
+      const created = await createSingleSession(
         currentYear,
         addingToDate,
         nextSessionNumber,
         sessionName,
         user.email
       );
-      
-      await loadSessions(currentYear);
+
+      setSessions((prev) => [...prev, created]);
       setAddingToDate(null);
       setNewSessionName('');
     } catch (error) {
@@ -373,7 +368,10 @@ export default function ManageSessionsPage() {
             <div className="space-y-4">
               {Object.entries(sessionsByDate)
                 .sort(([dateA], [dateB]) => dateB.localeCompare(dateA))
-                .map(([date, dateSessions]) => {
+                .map(([date, dateSessionsRaw]) => {
+                  const dateSessions = [...dateSessionsRaw].sort(
+                    (a, b) => (a.sessionNumber || 0) - (b.sessionNumber || 0)
+                  );
                   const dateKey = `date-group-${date}`;
                   const isExpanded = expandedDate === date;
 
