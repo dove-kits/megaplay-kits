@@ -8,7 +8,6 @@ import {
   deleteDoc,
   query,
   where,
-  orderBy,
   serverTimestamp,
   updateDoc,
   writeBatch,
@@ -28,11 +27,26 @@ export interface Session {
   year: string;
 }
 
+// Firestore allows 500 operations per batch; stay safely below.
+const BATCH_LIMIT = 450;
+
+/**
+ * Today's date as YYYY-MM-DD in the user's LOCAL timezone.
+ * FIX: `new Date().toISOString()` is UTC, so in India (UTC+5:30) "today"
+ * was still yesterday between 12:00 AM and 5:30 AM.
+ */
+export const getLocalDateString = (d: Date = new Date()): string => {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
 // Create multiple sessions for a date
 export const createSessions = async (
   year: string,
   date: string,
-  sessionNames: string[], // Array of names like ["Morning Practice", "Afternoon", ...]
+  sessionNames: string[],
   createdBy: string
 ): Promise<void> => {
   const colName = getYearCollectionName('sessions', year);
@@ -68,26 +82,15 @@ export const getSessionsByDate = async (
 ): Promise<Session[]> => {
   try {
     const colName = getYearCollectionName('sessions', year);
-    
-    // Simple query without orderBy to avoid index requirement
-    const q = query(
-      collection(db, colName),
-      where('date', '==', date)
-    );
-    const snap = await getDocs(q);
+    const snap = await getDocs(query(collection(db, colName), where('date', '==', date)));
 
     const sessions: Session[] = [];
     snap.forEach((d) => {
       const data = d.data() as Session;
-      // Validate data before adding
-      if (data && data.sessionId && data.date) {
-        sessions.push(data);
-      }
+      if (data && data.sessionId && data.date) sessions.push(data);
     });
 
-    // Sort in memory by sessionNumber
     sessions.sort((a, b) => (a.sessionNumber || 0) - (b.sessionNumber || 0));
-
     return sessions;
   } catch (error) {
     console.error('Error getting sessions by date:', error);
@@ -95,21 +98,17 @@ export const getSessionsByDate = async (
   }
 };
 
-// Get all sessions for a year (grouped by date)
+// Get all sessions for a year (1 read per session)
 export const getAllSessions = async (year: string): Promise<Session[]> => {
   try {
     const colName = getYearCollectionName('sessions', year);
-    
-    // Simple query without orderBy
     const snap = await getDocs(collection(db, colName));
 
     const sessions: Session[] = [];
     snap.forEach((d) => {
-      if (d.id === 'metadata') return;
-      
+      if (d.id === 'metadata' || d.id === '_init') return;
+
       const data = d.data() as Session;
-      
-      // Validate that essential fields exist
       if (data && data.sessionId && data.date && typeof data.date === 'string') {
         sessions.push(data);
       } else {
@@ -117,21 +116,14 @@ export const getAllSessions = async (year: string): Promise<Session[]> => {
       }
     });
 
-    // Sort in memory by date (descending) and sessionNumber with null safety
     sessions.sort((a, b) => {
-      // Ensure both dates exist and are strings
       const dateA = a.date || '';
       const dateB = b.date || '';
-      
-      if (dateA === dateB) {
-        return (a.sessionNumber || 0) - (b.sessionNumber || 0);
-      }
-      
-      // Handle empty dates
+
+      if (dateA === dateB) return (a.sessionNumber || 0) - (b.sessionNumber || 0);
       if (!dateA) return 1;
       if (!dateB) return -1;
-      
-      return dateB.localeCompare(dateA); // Descending date order
+      return dateB.localeCompare(dateA); // newest date first
     });
 
     return sessions;
@@ -148,21 +140,16 @@ export const getSessionById = async (
 ): Promise<Session | null> => {
   try {
     const colName = getYearCollectionName('sessions', year);
-    const ref = doc(db, colName, sessionId);
-    const snap = await getDoc(ref);
-    
-    if (!snap.exists()) {
-      return null;
-    }
-    
+    const snap = await getDoc(doc(db, colName, sessionId));
+
+    if (!snap.exists()) return null;
+
     const data = snap.data() as Session;
-    
-    // Validate data
     if (!data.sessionId || !data.date) {
       console.error('Invalid session data:', data);
       return null;
     }
-    
+
     return data;
   } catch (error) {
     console.error('Error getting session by ID:', error);
@@ -180,12 +167,9 @@ export const updateSessionName = async (
     if (!newName || !newName.trim()) {
       throw new Error('Session name cannot be empty');
     }
-    
+
     const colName = getYearCollectionName('sessions', year);
-    const ref = doc(db, colName, sessionId);
-    
-    await updateDoc(ref, { name: newName.trim() });
-    console.log('✅ Session name updated:', sessionId);
+    await updateDoc(doc(db, colName, sessionId), { name: newName.trim() });
   } catch (error) {
     console.error('Error updating session name:', error);
     throw error;
@@ -199,20 +183,24 @@ export const checkSessionAttendance = async (
 ): Promise<{ hasAttendance: boolean; count: number }> => {
   try {
     const colName = getYearCollectionName('attendance', year);
-    const q = query(collection(db, colName), where('sessionId', '==', sessionId));
-    const snap = await getDocs(q);
+    const snap = await getDocs(
+      query(collection(db, colName), where('sessionId', '==', sessionId))
+    );
 
-    return {
-      hasAttendance: !snap.empty,
-      count: snap.size,
-    };
+    return { hasAttendance: !snap.empty, count: snap.size };
   } catch (error) {
     console.error('Error checking session attendance:', error);
     return { hasAttendance: false, count: 0 };
   }
 };
 
-// Delete session (and optionally attendance)
+/**
+ * Delete session (and optionally its attendance).
+ * FIX: a single batch is limited to 500 operations. A session with ~500
+ * attendance records + the session doc exceeded that and failed. Attendance
+ * is now deleted in chunks, and the session doc is removed last so a failed
+ * run can simply be retried.
+ */
 export const deleteSession = async (
   year: string,
   sessionId: string,
@@ -223,26 +211,19 @@ export const deleteSession = async (
     const attendanceColName = getYearCollectionName('attendance', year);
 
     if (deleteAttendance) {
-      // Delete session and all attendance records
-      const batch = writeBatch(db);
-
-      // Delete session
-      batch.delete(doc(db, sessionColName, sessionId));
-
-      // Get and delete all attendance records
-      const q = query(
-        collection(db, attendanceColName),
-        where('sessionId', '==', sessionId)
+      const snap = await getDocs(
+        query(collection(db, attendanceColName), where('sessionId', '==', sessionId))
       );
-      const snap = await getDocs(q);
-      snap.forEach((d) => {
-        batch.delete(d.ref);
-      });
 
-      await batch.commit();
+      for (let i = 0; i < snap.docs.length; i += BATCH_LIMIT) {
+        const batch = writeBatch(db);
+        snap.docs.slice(i, i + BATCH_LIMIT).forEach((d) => batch.delete(d.ref));
+        await batch.commit();
+      }
+
+      await deleteDoc(doc(db, sessionColName, sessionId));
       console.log(`✅ Session ${sessionId} and ${snap.size} attendance records deleted`);
     } else {
-      // Delete session only
       await deleteDoc(doc(db, sessionColName, sessionId));
       console.log('✅ Session deleted:', sessionId);
     }
@@ -252,38 +233,57 @@ export const deleteSession = async (
   }
 };
 
-// Auto-update session status based on date
-export const updateSessionStatus = async (year: string): Promise<void> => {
-  try {
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-    const colName = getYearCollectionName('sessions', year);
-    
-    // Query only by status (simpler, no index needed)
-    const q = query(
-      collection(db, colName),
-      where('status', '==', 'active')
-    );
-    const snap = await getDocs(q);
+/**
+ * Auto-complete sessions whose date has passed.
+ *
+ * This reads ALL active sessions, so it is throttled to once per local day
+ * per browser. Pass `force = true` to run it immediately.
+ */
+export const updateSessionStatus = async (
+  year: string,
+  force: boolean = false
+): Promise<void> => {
+  const today = getLocalDateString();
+  const throttleKey = `sessionStatusSync:${year}`;
 
-    // Filter in memory for date < today with null safety
-    const sessionsToUpdate = snap.docs.filter(doc => {
-      const data = doc.data();
-      // Ensure date exists and is a valid string
+  if (!force && typeof window !== 'undefined') {
+    try {
+      if (window.localStorage.getItem(throttleKey) === today) return;
+    } catch {
+      /* storage unavailable: just run */
+    }
+  }
+
+  try {
+    const colName = getYearCollectionName('sessions', year);
+    const snap = await getDocs(
+      query(collection(db, colName), where('status', '==', 'active'))
+    );
+
+    const sessionsToUpdate = snap.docs.filter((d) => {
+      const data = d.data();
       return data && data.date && typeof data.date === 'string' && data.date < today;
     });
 
-    if (sessionsToUpdate.length === 0) {
-      console.log('No sessions to update');
-      return;
+    for (let i = 0; i < sessionsToUpdate.length; i += BATCH_LIMIT) {
+      const batch = writeBatch(db);
+      sessionsToUpdate.slice(i, i + BATCH_LIMIT).forEach((d) => {
+        batch.update(d.ref, { status: 'completed' });
+      });
+      await batch.commit();
     }
 
-    const batch = writeBatch(db);
-    sessionsToUpdate.forEach((doc) => {
-      batch.update(doc.ref, { status: 'completed' });
-    });
+    if (sessionsToUpdate.length > 0) {
+      console.log(`✅ Updated ${sessionsToUpdate.length} sessions to completed`);
+    }
 
-    await batch.commit();
-    console.log(`✅ Updated ${sessionsToUpdate.length} sessions to completed`);
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem(throttleKey, today);
+      } catch {
+        /* ignore */
+      }
+    }
   } catch (error) {
     console.error('Error updating session status:', error);
   }
@@ -303,13 +303,13 @@ export const getSessionsCountByStatus = async (
     let total = 0;
 
     snap.forEach((d) => {
-      if (d.id === 'metadata') return;
-      
+      if (d.id === 'metadata' || d.id === '_init') return;
+
       const data = d.data();
       if (!data.sessionId) return;
-      
+
       total++;
-      
+
       switch (data.status) {
         case 'active':
           active++;
@@ -330,11 +330,10 @@ export const getSessionsCountByStatus = async (
   }
 };
 
-// Get sessions for today
+// Get sessions for today (local timezone)
 export const getTodaySessions = async (year: string): Promise<Session[]> => {
   try {
-    const today = new Date().toISOString().split('T')[0];
-    return await getSessionsByDate(year, today);
+    return await getSessionsByDate(year, getLocalDateString());
   } catch (error) {
     console.error('Error getting today sessions:', error);
     return [];
@@ -342,16 +341,10 @@ export const getTodaySessions = async (year: string): Promise<Session[]> => {
 };
 
 // Cancel a session
-export const cancelSession = async (
-  year: string,
-  sessionId: string
-): Promise<void> => {
+export const cancelSession = async (year: string, sessionId: string): Promise<void> => {
   try {
     const colName = getYearCollectionName('sessions', year);
-    const ref = doc(db, colName, sessionId);
-    
-    await updateDoc(ref, { status: 'cancelled' });
-    console.log('✅ Session cancelled:', sessionId);
+    await updateDoc(doc(db, colName, sessionId), { status: 'cancelled' });
   } catch (error) {
     console.error('Error cancelling session:', error);
     throw error;
@@ -359,16 +352,10 @@ export const cancelSession = async (
 };
 
 // Reactivate a session
-export const reactivateSession = async (
-  year: string,
-  sessionId: string
-): Promise<void> => {
+export const reactivateSession = async (year: string, sessionId: string): Promise<void> => {
   try {
     const colName = getYearCollectionName('sessions', year);
-    const ref = doc(db, colName, sessionId);
-    
-    await updateDoc(ref, { status: 'active' });
-    console.log('✅ Session reactivated:', sessionId);
+    await updateDoc(doc(db, colName, sessionId), { status: 'active' });
   } catch (error) {
     console.error('Error reactivating session:', error);
     throw error;
@@ -383,14 +370,13 @@ export const updateSessionAttendanceCount = async (
 ): Promise<void> => {
   try {
     const colName = getYearCollectionName('sessions', year);
-    const ref = doc(db, colName, sessionId);
-    
-    await updateDoc(ref, { attendanceCount: count });
+    await updateDoc(doc(db, colName, sessionId), { attendanceCount: count });
   } catch (error) {
     console.error('Error updating attendance count:', error);
     throw error;
   }
 };
+
 // Create a single session for a date (for adding to existing dates)
 export const createSingleSession = async (
   year: string,
@@ -400,10 +386,9 @@ export const createSingleSession = async (
   createdBy: string
 ): Promise<void> => {
   const colName = getYearCollectionName('sessions', year);
-  
-  // Generate unique session ID using timestamp to avoid conflicts
-  const timestamp = Date.now();
-  const sessionId = `session_${date.replace(/-/g, '')}_${sessionNumber}_${timestamp}`;
+
+  // Unique ID using timestamp to avoid conflicts
+  const sessionId = `session_${date.replace(/-/g, '')}_${sessionNumber}_${Date.now()}`;
   const ref = doc(db, colName, sessionId);
 
   const sessionData: Session = {
