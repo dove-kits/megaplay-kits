@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useAuth } from '../../../../context/AuthContext';
 import { useRouter } from 'next/navigation';
 import Image from 'next/image';
@@ -9,6 +9,8 @@ import { isAttendanceFaculty } from '@/lib/services/attendanceFacultyService';
 import { getAllSessions, Session } from '@/lib/services/sessionService';
 import {
   getAllAttendance,
+  getAttendanceByDate,
+  getSessionAttendance,
   AttendanceRecord,
 } from '@/lib/services/attendanceService';
 import { getBaseCommittees, BaseCommittee } from '@/lib/services/committeeService';
@@ -109,10 +111,11 @@ export default function AttendanceReportsPage() {
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [baseCommittees, setBaseCommittees] = useState<BaseCommittee[]>([]);
 
-  // All Data
-  const [allAttendance, setAllAttendance] = useState<AttendanceRecord[]>([]);
+  // Data: sessions are cached (1 read per session); attendance is loaded only
+  // for the selected date / session (or the full year on request).
   const [allSessions, setAllSessions] = useState<Session[]>([]);
-  const [filteredAttendance, setFilteredAttendance] = useState<AttendanceRecord[]>([]);
+  const [records, setRecords] = useState<AttendanceRecord[]>([]);
+  const [fullYearLoaded, setFullYearLoaded] = useState(false);
 
   // Filters
   const [selectedDate, setSelectedDate] = useState('');
@@ -122,6 +125,7 @@ export default function AttendanceReportsPage() {
 
   // UI State
   const [loadingData, setLoadingData] = useState(false);
+  const [fetching, setFetching] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportingType, setExportingType] = useState<'csv' | 'excel' | 'pdf' | null>(null);
   
@@ -132,9 +136,9 @@ export default function AttendanceReportsPage() {
     setToast({ message, type });
   };
 
-  const closeToast = () => {
+  const closeToast = useCallback(() => {
     setToast(null);
-  };
+  }, []);
 
   // Get committee name by key from base committees
   const getCommitteeName = useCallback((key: string | undefined | null): string => {
@@ -199,18 +203,16 @@ export default function AttendanceReportsPage() {
         return;
       }
 
-      // Load all data
+      // Only sessions (cached) + committees (cached). Attendance is NOT loaded
+      // here: it is fetched when a date / session is chosen.
       setLoadingData(true);
-      const [attendance, sessions, committees] = await Promise.all([
-        getAllAttendance(settings.currentYear),
+      const [sessions, committees] = await Promise.all([
         getAllSessions(settings.currentYear),
         getBaseCommittees(),
       ]);
 
-      setAllAttendance(attendance);
       setAllSessions(sessions);
       setBaseCommittees(Array.isArray(committees) ? committees : []);
-      setFilteredAttendance(attendance);
       setLoadingData(false);
     } catch (error) {
       console.error('Failed to load data:', error);
@@ -228,40 +230,56 @@ export default function AttendanceReportsPage() {
     }
     loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user, authLoading]);
+  }, [user?.uid, authLoading]);
 
-  // Apply filters
+  // Fetch attendance for the current selection
   useEffect(() => {
-    let filtered = [...allAttendance];
+    if (!currentYear) return;
 
-    // Date filter
-    if (selectedDate) {
-      filtered = filtered.filter((record) => record.date === selectedDate);
+    // Nothing selected and full year not requested: nothing to load
+    if (!selectedDate && !fullYearLoaded) {
+      setRecords([]);
+      return;
     }
 
-    // Session filter
-    if (selectedSession) {
-      filtered = filtered.filter((record) => record.sessionId === selectedSession);
-    }
+    let cancelled = false;
 
-    // Category filter
-    if (selectedCategory !== 'all') {
-      if (selectedCategory === 'lab') {
-        filtered = filtered.filter((record) => record.markedCategory === 'lab');
-      } else if (selectedCategory === 'od') {
-        filtered = filtered.filter((record) => record.markedCategory === 'od');
-      } else if (selectedCategory === 'scholarship') {
-        filtered = filtered.filter((record) => record.markedCategory === 'scholarship');
+    (async () => {
+      setFetching(true);
+      try {
+        const data = selectedSession
+          ? await getSessionAttendance(currentYear, selectedSession)
+          : selectedDate
+          ? await getAttendanceByDate(currentYear, selectedDate)
+          : await getAllAttendance(currentYear);
+
+        if (!cancelled) setRecords(data);
+      } catch (error) {
+        console.error('Failed to load attendance:', error);
+        if (!cancelled) {
+          setRecords([]);
+          showToast('Failed to load attendance records', 'error');
+        }
+      } finally {
+        if (!cancelled) setFetching(false);
       }
-    }
+    })();
 
-    // Committee filter
-    if (selectedCommittee !== 'all') {
-      filtered = filtered.filter((record) => record.registeredCommittee === selectedCommittee);
-    }
+    return () => {
+      cancelled = true;
+    };
+  }, [currentYear, selectedDate, selectedSession, fullYearLoaded]);
 
-    setFilteredAttendance(filtered);
-  }, [selectedDate, selectedSession, selectedCategory, selectedCommittee, allAttendance]);
+  // Category / committee filters run in the browser on what is already loaded (0 reads)
+  const filteredAttendance = useMemo(
+    () =>
+      records.filter(
+        (record) =>
+          (selectedCategory === 'all' || record.markedCategory === selectedCategory) &&
+          (selectedCommittee === 'all' || record.registeredCommittee === selectedCommittee)
+      ),
+    [records, selectedCategory, selectedCommittee]
+  );
 
   const handleLogout = async () => {
     if (isLoggingOut) return;
@@ -278,17 +296,14 @@ export default function AttendanceReportsPage() {
     }
   };
 
-  // Get unique dates - with null safety
+  // Dates come from the (cached) sessions list, not from attendance records
   const uniqueDates = Array.from(
     new Set(
-      allAttendance
-        .filter((a) => a.date && typeof a.date === 'string')
-        .map((a) => a.date)
+      allSessions
+        .filter((s) => s.date && typeof s.date === 'string')
+        .map((s) => s.date)
     )
-  ).sort((a, b) => {
-    if (!a || !b) return 0;
-    return b.localeCompare(a);
-  });
+  ).sort((a, b) => b.localeCompare(a));
 
   // Get sessions for selected date
   const sessionsForDate = selectedDate
@@ -415,9 +430,6 @@ export default function AttendanceReportsPage() {
       const workbook = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(workbook, worksheet, 'Attendance');
 
-      // Style the worksheet
-      const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1');
-      
       // Set column widths
       worksheet['!cols'] = [
         { wch: 30 }, // Name
@@ -777,7 +789,7 @@ export default function AttendanceReportsPage() {
                 </div>
 
                 {/* Clear Filters */}
-                {(selectedDate || selectedSession || selectedCategory !== 'all' || selectedCommittee !== 'all') && (
+                {(selectedDate || selectedSession || selectedCategory !== 'all' || selectedCommittee !== 'all' || fullYearLoaded) && (
                   <div className="mt-5 pt-5 border-t border-white/10">
                     <button
                       onClick={() => {
@@ -785,6 +797,7 @@ export default function AttendanceReportsPage() {
                         setSelectedSession('');
                         setSelectedCategory('all');
                         setSelectedCommittee('all');
+                        setFullYearLoaded(false);
                       }}
                       className="px-5 py-2.5 bg-white/10 hover:bg-white/20 text-white text-sm font-semibold rounded-xl transition-all duration-200 hover:scale-105 active:scale-95 flex items-center gap-2"
                     >
@@ -809,7 +822,7 @@ export default function AttendanceReportsPage() {
                 <div className="flex flex-wrap gap-3">
                   <button
                     onClick={downloadCSV}
-                    disabled={!filteredAttendance.length || exporting}
+                    disabled={!filteredAttendance.length || exporting || fetching}
                     className="px-4 sm:px-6 py-2 sm:py-3 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white text-sm sm:text-base font-semibold rounded-xl shadow-lg transition-all duration-200 hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 flex items-center gap-2"
                   >
                     <svg className="w-4 sm:w-5 h-4 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -826,7 +839,7 @@ export default function AttendanceReportsPage() {
 
                   <button
                     onClick={downloadExcel}
-                    disabled={!filteredAttendance.length || exporting}
+                    disabled={!filteredAttendance.length || exporting || fetching}
                     className="px-4 sm:px-6 py-2 sm:py-3 bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 text-white text-sm sm:text-base font-semibold rounded-xl shadow-lg transition-all duration-200 hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 flex items-center gap-2"
                   >
                     <svg className="w-4 sm:w-5 h-4 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -843,7 +856,7 @@ export default function AttendanceReportsPage() {
 
                   <button
                     onClick={downloadPDF}
-                    disabled={!filteredAttendance.length || exporting}
+                    disabled={!filteredAttendance.length || exporting || fetching}
                     className="px-4 sm:px-6 py-2 sm:py-3 bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white text-sm sm:text-base font-semibold rounded-xl shadow-lg transition-all duration-200 hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 flex items-center gap-2"
                   >
                     <svg className="w-4 sm:w-5 h-4 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -884,7 +897,28 @@ export default function AttendanceReportsPage() {
                   </div>
                 </div>
 
-                {filteredAttendance.length === 0 ? (
+                {!selectedDate && !fullYearLoaded ? (
+                  <div className="text-center py-16">
+                    <svg className="w-16 h-16 mx-auto text-white/30 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                    </svg>
+                    <p className="text-white/60 text-lg font-medium">Select a date to load its records</p>
+                    <p className="text-white/40 text-sm mt-2 mb-6">
+                      Only the records for the chosen date or session are loaded, which keeps database usage low.
+                    </p>
+                    <button
+                      onClick={() => setFullYearLoaded(true)}
+                      className="px-5 py-2.5 bg-white/10 hover:bg-white/20 text-white text-sm font-semibold rounded-xl transition-all"
+                    >
+                      Load full year (large)
+                    </button>
+                  </div>
+                ) : fetching ? (
+                  <div className="text-center py-16">
+                    <div className="w-12 h-12 border-4 border-purple-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                    <p className="text-white/70">Loading attendance records...</p>
+                  </div>
+                ) : filteredAttendance.length === 0 ? (
                   <div className="text-center py-16">
                     <svg className="w-16 h-16 mx-auto text-white/30 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
