@@ -7,7 +7,11 @@ import { useRouter } from 'next/navigation';
 import Image from 'next/image';
 import { getAppSettings } from '@/lib/services/settingsService';
 import { isAttendanceFaculty } from '@/lib/services/attendanceFacultyService';
-import { createSessions, getSessionsByDate } from '@/lib/services/sessionService';
+import {
+  createSessions,
+  getSessionsByDate,
+  getLocalDateString,
+} from '@/lib/services/sessionService';
 
 
 interface SessionInput {
@@ -195,7 +199,8 @@ export default function CreateSessionsPage() {
       return;
     }
     loadData();
-  }, [user, authLoading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.uid, authLoading]);
 
 
   const loadData = async () => {
@@ -226,8 +231,8 @@ export default function CreateSessionsPage() {
       }
 
 
-      // Set default date to today
-      const today = new Date().toISOString().split('T')[0];
+      // Set default date to today (local timezone, not UTC)
+      const today = getLocalDateString();
       setSelectedDate(today);
       
       // Check for existing sessions on default date
@@ -269,7 +274,7 @@ export default function CreateSessionsPage() {
   };
 
 
-  const handleGenerateSessions = async () => {
+  const handleGenerateSessions = () => {
     setError('');
 
 
@@ -286,16 +291,8 @@ export default function CreateSessionsPage() {
     }
 
 
-    // Double-check for existing sessions before generating
-    if (currentYear) {
-      const existingSessions = await getSessionsByDate(currentYear, selectedDate);
-      if (existingSessions.length > 0) {
-        setExistingSessionsCount(existingSessions.length);
-        setShowWarningModal(true);
-        return;
-      }
-    }
-
+    // Existing sessions for this date were already checked when the date was
+    // selected (see handleDateChange / loadData), so no extra read here.
 
     // Generate session inputs with default names
     const inputs: SessionInput[] = [];
