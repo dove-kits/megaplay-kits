@@ -8,18 +8,18 @@ import { getAppSettings, getYearCollectionName } from '@/lib/services/settingsSe
 import { isAttendanceFaculty } from '@/lib/services/attendanceFacultyService';
 import { 
   getAllStudents, 
+  deleteStudent,
   Student,
 } from '@/lib/services/studentService';
 import { 
-  getAllAttendance, 
+  getStudentAttendance,
+  deleteStudentAttendance,
   AttendanceRecord 
 } from '@/lib/services/attendanceService';
+import { getSessionCount } from '@/lib/services/sessionService';
 import { getBaseCommittees, BaseCommittee } from '@/lib/services/committeeService';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-// Firebase imports - moved to top
-import { doc, deleteDoc, collection, query, where, getDocs, updateDoc } from 'firebase/firestore';
-import { db } from '@/lib/firebase/config';
 
 // Define available columns for selection
 type ColumnKey = 'regno' | 'name' | 'email' | 'phone' | 'department' | 'hostel' | 'roomNumber' | 'committee' | 'category' | 'status';
@@ -104,7 +104,8 @@ export default function AttendanceAdminSearchPage() {
     date: '',
     category: 'all',
   });
-  const [allSessionsData, setAllSessionsData] = useState<any[]>([]);
+  // Total number of sessions in the year (COUNT query, ~1 read)
+  const [totalSessions, setTotalSessions] = useState(0);
 
   // Messages
   const [error, setError] = useState<string | null>(null);
@@ -165,7 +166,7 @@ export default function AttendanceAdminSearchPage() {
     }
     loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user, authLoading]);
+  }, [user?.uid, authLoading]);
 
   // Helper function to get committee name
   const getCommitteeName = useCallback((key: string | undefined) => {
@@ -528,35 +529,17 @@ export default function AttendanceAdminSearchPage() {
 
     setDeleting(true);
     try {
-      const firestore = await import('firebase/firestore');
-      const config = await import('@/lib/firebase/config');
+      // Attendance first (batched), then the student, so a failed run can be retried
+      const removed = await deleteStudentAttendance(currentYear, selectedStudent.regno);
 
-      const database = config.db;
-
-      if (!database) {
-        throw new Error('Firebase database not initialized');
+      const res = await deleteStudent(currentYear, selectedStudent.regno);
+      if (!res.success) {
+        throw new Error(res.error || 'Failed to delete student');
       }
-
-      const studentsCol = getYearCollectionName('students', currentYear);
-      const attendanceCol = getYearCollectionName('attendance', currentYear);
-
-      const studentRef = firestore.doc(database, studentsCol, selectedStudent.regno);
-      await firestore.deleteDoc(studentRef);
-
-      const attendanceQuery = firestore.query(
-        firestore.collection(database, attendanceCol),
-        firestore.where('regno', '==', selectedStudent.regno)
-      );
-      const attendanceSnapshot = await firestore.getDocs(attendanceQuery);
-
-      const deletePromises = attendanceSnapshot.docs.map(docSnapshot => 
-        firestore.deleteDoc(firestore.doc(database, attendanceCol, docSnapshot.id))
-      );
-      await Promise.all(deletePromises);
 
       setAllStudents(prev => prev.filter(s => s.regno !== selectedStudent.regno));
 
-      setSuccess(`✅ Student ${selectedStudent.regno} and ${attendanceSnapshot.size} attendance record(s) deleted successfully`);
+      setSuccess(`✅ Student ${selectedStudent.regno} and ${removed} attendance record(s) deleted successfully`);
       setTimeout(() => setSuccess(null), 3000);
       setShowDeleteModal(false);
       setSelectedStudent(null);
@@ -623,31 +606,21 @@ export default function AttendanceAdminSearchPage() {
     setShowAttendanceModal(true);
 
     try {
-      const firestore = await import('firebase/firestore');
-      const config = await import('@/lib/firebase/config');
+      // Only this student's records (~30 reads) + a COUNT of sessions (~1 read),
+      // instead of reading every attendance record of the year.
+      const [records, sessionCount] = await Promise.all([
+        getStudentAttendance(currentYear, student.regno),
+        getSessionCount(currentYear),
+      ]);
 
-      const database = config.db;
-
-      if (!database) {
-        throw new Error('Firebase database not initialized');
-      }
-
-      const sessionsCol = getYearCollectionName('sessions', currentYear);
-      const sessionsSnapshot = await firestore.getDocs(firestore.collection(database, sessionsCol));
-      const totalSessions = sessionsSnapshot.size;
-      setAllSessionsData(sessionsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-
-      const allAttendance = await getAllAttendance(currentYear);
-      const studentRecords = (allAttendance || []).filter(
-        (record) => record?.regno === student?.regno
-      );
-      setStudentAttendance(studentRecords);
+      setStudentAttendance(records);
+      setTotalSessions(sessionCount);
     } catch (error) {
       console.error('Failed to load attendance:', error);
       setError('Failed to load attendance records.');
       setTimeout(() => setError(null), 3000);
       setStudentAttendance([]);
-      setAllSessionsData([]);
+      setTotalSessions(0);
     } finally {
       setLoadingAttendance(false);
     }
@@ -691,9 +664,9 @@ export default function AttendanceAdminSearchPage() {
 
   // Calculate attendance percentage
   const calculateAttendancePercentage = () => {
-    if (allSessionsData.length === 0) return 0;
+    if (totalSessions === 0) return 0;
 
-    const totalHours = allSessionsData.length * 3;
+    const totalHours = totalSessions * 3;
     const attendedHours = studentAttendance.length * 3;
 
     return totalHours > 0 ? ((attendedHours / totalHours) * 100).toFixed(2) : 0;
@@ -1648,8 +1621,8 @@ export default function AttendanceAdminSearchPage() {
                 <div className="mt-4 grid grid-cols-1 md:grid-cols-4 gap-4">
                   <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
                     <p className="text-xs text-white/60 uppercase tracking-wider mb-1">Total Sessions</p>
-                    <p className="text-2xl font-bold text-white">{allSessionsData.length}</p>
-                    <p className="text-xs text-white/50 mt-1">{allSessionsData.length * 3} hours</p>
+                    <p className="text-2xl font-bold text-white">{totalSessions}</p>
+                    <p className="text-xs text-white/50 mt-1">{totalSessions * 3} hours</p>
                   </div>
                   <div className="bg-emerald-500/10 border border-emerald-400/30 rounded-2xl p-4">
                     <p className="text-xs text-emerald-300 uppercase tracking-wider mb-1">Attended</p>
@@ -1658,14 +1631,14 @@ export default function AttendanceAdminSearchPage() {
                   </div>
                   <div className="bg-red-500/10 border border-red-400/30 rounded-2xl p-4">
                     <p className="text-xs text-red-300 uppercase tracking-wider mb-1">Missed</p>
-                    <p className="text-2xl font-bold text-red-200">{allSessionsData.length - studentAttendance.length}</p>
-                    <p className="text-xs text-red-300/70 mt-1">{(allSessionsData.length - studentAttendance.length) * 3} hours</p>
+                    <p className="text-2xl font-bold text-red-200">{Math.max(0, totalSessions - studentAttendance.length)}</p>
+                    <p className="text-xs text-red-300/70 mt-1">{Math.max(0, totalSessions - studentAttendance.length) * 3} hours</p>
                   </div>
                   <div className="bg-purple-500/10 border border-purple-400/30 rounded-2xl p-4">
                     <p className="text-xs text-purple-300 uppercase tracking-wider mb-1">Percentage</p>
                     <p className="text-2xl font-bold text-purple-200">{calculateAttendancePercentage()}%</p>
                     <p className="text-xs text-purple-300/70 mt-1">
-                      {parseFloat(calculateAttendancePercentage() as string) >= 75 ? '✓ Good' : '⚠ Low'}
+                      {parseFloat(String(calculateAttendancePercentage())) >= 75 ? '✓ Good' : '⚠ Low'}
                     </p>
                   </div>
                 </div>
@@ -1713,7 +1686,7 @@ export default function AttendanceAdminSearchPage() {
                 ) : (
                   <div className="space-y-3">
                     {filteredAttendance.map((record, index) => (
-                      <div key={index} className="bg-white/5 border border-white/10 rounded-2xl p-4 hover:bg-white/10 transition-colors">
+                      <div key={record.attendanceId || index} className="bg-white/5 border border-white/10 rounded-2xl p-4 hover:bg-white/10 transition-colors">
                         <div className="flex items-center justify-between">
                           <div className="flex-1">
                             <div className="flex items-center gap-3 mb-2">
@@ -1747,7 +1720,7 @@ export default function AttendanceAdminSearchPage() {
                     setShowAttendanceModal(false);
                     setSelectedStudent(null);
                     setStudentAttendance([]);
-                    setAllSessionsData([]);
+                    setTotalSessions(0);
                     setAttendanceFilters({ date: '', category: 'all' });
                   }}
                   className="px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/20 text-white rounded-2xl font-medium transition-all"
