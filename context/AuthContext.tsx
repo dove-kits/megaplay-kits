@@ -1,17 +1,15 @@
 'use client';
 
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { 
-  User, 
+import { createContext, useContext, useState, useEffect, useRef, ReactNode } from 'react';
+import {
+  User,
   signInWithPopup,
   signOut as firebaseSignOut,
-  onAuthStateChanged
+  onAuthStateChanged,
 } from 'firebase/auth';
 import { auth, googleProvider } from '@/lib/firebase/config';
 import { isKarunyaEmail } from '@/lib/validators/emailValidator';
 import { createOrUpdateUserDocument, UserData } from '@/lib/services/userService';
-import { isSuperAdmin } from '@/lib/utils/roleCheck';
-import { getAppSettings } from '../lib/services/settingsService';
 
 interface AuthContextType {
   user: User | null;
@@ -36,33 +34,38 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [userData, setUserData] = useState<UserData | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Remembers the in-flight / finished Firestore sync per uid so that
+  // React Strict Mode (dev) or repeated auth callbacks never sync twice.
+  const syncRef = useRef<{ uid: string; promise: Promise<UserData> } | null>(null);
+
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      console.log('Auth state changed:', user?.email);
-      
-      if (user && user.email) {
-        if (!isKarunyaEmail(user.email)) {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser && firebaseUser.email) {
+        if (!isKarunyaEmail(firebaseUser.email)) {
           console.log('Invalid email domain, signing out');
+          syncRef.current = null;
           await firebaseSignOut(auth);
           setUser(null);
           setUserData(null);
         } else {
-          console.log('Valid user, setting state');
-          setUser(user);
-          
-          // ✅ Get current year from settings
-          const settings = await getAppSettings();
-          console.log('Current year:', settings?.currentYear);
-          
+          setUser(firebaseUser);
+
           try {
-            const firestoreUserData = await createOrUpdateUserDocument(user);
+            if (!syncRef.current || syncRef.current.uid !== firebaseUser.uid) {
+              syncRef.current = {
+                uid: firebaseUser.uid,
+                promise: createOrUpdateUserDocument(firebaseUser),
+              };
+            }
+            const firestoreUserData = await syncRef.current.promise;
             setUserData(firestoreUserData);
-            console.log('User data synced with Firestore for year:', firestoreUserData.year);
           } catch (error) {
             console.error('Failed to sync user data:', error);
+            syncRef.current = null; // allow retry on next auth event
           }
         }
       } else {
+        syncRef.current = null;
         setUser(null);
         setUserData(null);
       }
@@ -75,15 +78,16 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const signInWithGoogle = async () => {
     try {
       const result = await signInWithPopup(auth, googleProvider);
-      console.log('Sign in successful:', result.user.email);
-      
+
       if (!result.user.email || !isKarunyaEmail(result.user.email)) {
         await firebaseSignOut(auth);
-        throw new Error('Only Karunya emails are allowed (@karunya.edu, @karunya.edu.in, @kate.academy, @kate.education)');
+        throw new Error(
+          'Only Karunya emails are allowed (@karunya.edu, @karunya.edu.in, @kate.academy, @kate.education)'
+        );
       }
     } catch (error: any) {
       console.error('Error signing in with Google:', error);
-      
+
       if (error.code === 'auth/popup-closed-by-user') {
         throw new Error('Sign-in popup was closed. Please try again.');
       }
@@ -93,9 +97,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   const signOut = async () => {
     try {
+      syncRef.current = null;
       await firebaseSignOut(auth);
       setUserData(null);
-      console.log('User signed out successfully');
     } catch (error) {
       console.error('Error signing out:', error);
       throw error;
@@ -107,12 +111,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     userData,
     loading,
     signInWithGoogle,
-    signOut
+    signOut,
   };
 
-  return (
-    <AuthContext.Provider value={value}>
-      {children}
-    </AuthContext.Provider>
-  );
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
