@@ -8,6 +8,7 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import { db } from '@/lib/firebase/config';
+import { clearStudentsCache } from './studentService';
 
 export interface YearData {
   year: string;
@@ -20,9 +21,8 @@ export interface YearData {
 
 /**
  * Sub-collections the app ACTUALLY uses under years/{year}/.
- * FIX: this list had 'coordinators' and 'attendanceFaculty', but the services
- * use 'attendance_coordinators' and 'attendance_faculty'. Deleting a year
- * therefore left coordinator and attendance-faculty data behind.
+ * 'attendance_coordinators' and 'attendance_faculty' are the real names.
+ * 'meta' holds the sessionsSummary doc, so deleting a year removes it too.
  */
 const YEAR_COLLECTIONS = [
   'students',
@@ -34,19 +34,19 @@ const YEAR_COLLECTIONS = [
   'faculties',
   'users',
   'sessions',
+  'meta',
 ];
 
-// Old names, cleaned up on delete for years created before this fix.
+// Old names, cleaned up on delete for years created before the rename.
 const LEGACY_COLLECTIONS = ['coordinators', 'attendanceFaculty'];
 
 const BATCH_LIMIT = 450;
 
 /**
  * Create a new academic year.
- * CHANGE: no longer writes an "_init" placeholder doc into every
- * sub-collection. Firestore doesn't need collections to be "initialised", and
- * those docs were being returned by getDocs() as fake students, committees,
- * faculties, attendance records, etc.
+ * No "_init" placeholder docs are written into sub-collections: Firestore
+ * doesn't need collections to be "initialised", and those docs were being
+ * returned by getDocs() as fake students, committees, faculties, etc.
  */
 export const createNewYear = async (year: string): Promise<YearData> => {
   const yearRef = doc(db, 'years', year);
@@ -121,6 +121,7 @@ export const deleteYear = async (year: string): Promise<void> => {
     }
 
     await deleteDoc(doc(db, 'years', year));
+    clearStudentsCache(year); // don't serve a deleted year's student list from cache
     console.log(`🎉 Deleted year ${year} (${totalDocumentsDeleted} documents)`);
   } catch (error) {
     console.error('❌ Error deleting year:', error);
