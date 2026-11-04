@@ -424,9 +424,9 @@ export const getStudentAttendanceByDates = async (
       return byDate !== 0 ? byDate : a.sessionNumber - b.sessionNumber;
     });
     return records;
-  } catch (error) {
+    } catch (error) {
     console.error('Error getting student attendance by dates:', error);
-    return [];
+    throw error;   // was: return [];
   }
 };
 
